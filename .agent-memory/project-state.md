@@ -123,3 +123,6 @@ AGENTS.md §0 strengthened: the Mahabharata voice now defines the agent's charac
 MODELS refreshed from ~/.cache/opencode/models.json: 48 entries (24 free zen/v1 + 24 paid opencode-go; new: mimo-v2.5-pro, trinity-large-preview-free, ling/laguna/ring/nemotron-ultra free, grok-code, big-pickle, …). /models modal upgraded: filter input (name/id substring), non-selectable Free/Paid section headers, active model ✓ + scrolled into view on open, ↑/↓ skip headers, Enter from filter activates.
 ## 2026-08-04 00:58
 session: Help me plan the next feature for this project. → ok
+
+## 2026-08-16 — Go migration plan drafted
+`docs/go-migration-plan.md` proposes a full Go port on branch `docs/go-migration-plan`: bubbletea TUI, stdlib-only core (+ x/sync/errgroup), goroutine AgentLoop with `chan AgentEvent`, 7 phases ≈ 20 person-days, parity gate before Python tree removal. Status: proposal — no code touched.
