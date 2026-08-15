@@ -125,4 +125,4 @@ MODELS refreshed from ~/.cache/opencode/models.json: 48 entries (24 free zen/v1 
 session: Help me plan the next feature for this project. → ok
 
 ## 2026-08-16 — Go migration plan drafted
-`docs/go-migration-plan.md` proposes a full Go port on branch `docs/go-migration-plan`: bubbletea TUI, stdlib-only core (+ x/sync/errgroup), goroutine AgentLoop with `chan AgentEvent`, 7 phases ≈ 20 person-days, parity gate before Python tree removal. Status: proposal — no code touched.
+`docs/go-migration-plan.md` proposes a full Go port on branch `docs/go-migration-plan`: bubbletea TUI, stdlib-only core (+ x/sync/errgroup), goroutine AgentLoop with `chan AgentEvent`, 7 phases ≈ 20 person-days, parity gate before Python tree removal. Status: proposal — no code touched. Revamped 2026-08-16 in the epic voice: seven vyuha formations (Chakra/Makara/Garuda/Kurma/Suchi/Padma/Krauncha) + the eighteenth-day parity gate; diagrams unchanged.
