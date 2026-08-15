@@ -99,6 +99,11 @@ class TestTui(unittest.TestCase):
         os.environ["KAAL_SESSIONS_DIR"] = str(self.root / "sessions")
         self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.root / "config")
+        # Hermetic API key: XDG_CONFIG_HOME points at the temp dir, so the
+        # key lands in the temp store. Tests that build their own gateway
+        # (startup default model, /models switch) would otherwise hit
+        # config.get_api_key()'s SystemExit(1) on keyless CI.
+        config.save_user_api_key("sk-test")
 
     def tearDown(self) -> None:
         if self._old_sessions_dir is None:
