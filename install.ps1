@@ -4,6 +4,8 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.ps1 | iex
+#   # development branch (before the merge to main):
+#   irm https://raw.githubusercontent.com/shivamnarkar47/kaal/docs/go-migration-plan/install.ps1 | iex
 #
 # Overrides:
 #   $env:KAAL_VERSION  release tag to fetch (default: latest)

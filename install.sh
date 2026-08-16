@@ -5,6 +5,8 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.sh | sh
+#   # development branch (before the merge to main):
+#   curl -fsSL https://raw.githubusercontent.com/shivamnarkar47/kaal/docs/go-migration-plan/install.sh | sh
 #
 # Overrides:
 #   KAAL_VERSION  release tag to fetch (default: latest)

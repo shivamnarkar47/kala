@@ -19,6 +19,18 @@ curl -fsSL https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.sh
 irm https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.ps1 | iex
 ```
 
+> **From the development branch** (`docs/go-migration-plan`) — until that
+> branch merges to `main`, the one-liners above 404 because `main` does not
+> carry the installers yet. Point the URL at the branch instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shivamnarkar47/kaal/docs/go-migration-plan/install.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/shivamnarkar47/kaal/docs/go-migration-plan/install.ps1 | iex
+```
+
 Both fetch the latest release binary, probe it with `--version`, and install
 it (`~/.local/bin/kaal` on unix, `%LOCALAPPDATA%\kaal\kaal.exe` on Windows).
 `kaal update` then self-updates the installed binary. Pin a version with
