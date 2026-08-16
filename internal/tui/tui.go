@@ -202,6 +202,7 @@ type Model struct {
 	maxSteps       int
 	allowDangerous bool
 	modelID        string
+	keyMissing     bool // no API key resolved at startup — /connect makes it live
 	agent          *prompts.Agent
 
 	// event marshaling seam (program.Send in production; tests swap it)
@@ -281,11 +282,34 @@ func New(projectDir string, maxSteps int, allowDangerous bool) (*Model, error) {
 	}
 	modelID := config.ResolveModelID("")
 	key, err := config.GetAPIKey()
+	keyMissing := err != nil
+	if keyMissing {
+		// Start anyway: the workbench is usable for /connect, /memory,
+		// /sessions, browsing; only sending needs a key.
+		key = ""
+	}
+	gw := &gateway.Gateway{BaseURL: config.ModelBaseURL(modelID), APIKey: key, Model: modelID}
+	m, err := NewWithGateway(gw, projectDir, modelID, maxSteps, allowDangerous)
 	if err != nil {
 		return nil, err
 	}
-	gw := &gateway.Gateway{BaseURL: config.ModelBaseURL(modelID), APIKey: key, Model: modelID}
-	return NewWithGateway(gw, projectDir, modelID, maxSteps, allowDangerous)
+	if keyMissing {
+		m.keyMissing = true
+		m.appendNotice("no API key — save one with /connect <key> to start chatting")
+	}
+	return m, nil
+}
+
+// applySavedKey pushes a key saved via /connect into the live gateway and
+// clears the missing-key state so the next turn can run. No-op when the
+// gateway is not the real one (tests inject fakes).
+func (m *Model) applySavedKey() {
+	if g, ok := m.gateway.(*gateway.Gateway); ok {
+		if key := config.LoadUserAPIKey(); key != "" {
+			g.APIKey = key
+			m.keyMissing = false
+		}
+	}
 }
 
 // NewWithGateway builds the workbench around an injected gateway (tests
@@ -363,6 +387,11 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Submit(task string) tea.Cmd {
 	task = strings.TrimSpace(task)
 	if task == "" || m.turnActive {
+		return nil
+	}
+	if m.keyMissing {
+		// No key: keep the typed text in the input and point at /connect.
+		m.appendError("no API key — save one with /connect <key> before sending")
 		return nil
 	}
 	m.appendUserBlock(task)
@@ -763,6 +792,7 @@ func (m *Model) runCommand(text string) {
 	case "/connect":
 		if arg != "" {
 			_ = config.SaveUserAPIKey(arg) // inline key, no popup
+			m.applySavedKey()
 			m.appendNotice("api key saved")
 		} else {
 			m.openConnectModal()
@@ -948,6 +978,10 @@ func (m *Model) renderHome() {
 	// are in view even on short terminals (the cast below is decorative).
 	sb.WriteString(m.dimStyle.Render(homeWelcome))
 	sb.WriteString("\n")
+	if m.keyMissing {
+		sb.WriteString(m.errorStyle.Render("no API key — run /connect <key> to start chatting"))
+		sb.WriteString("\n")
+	}
 	sb.WriteString(m.dimStyle.Render("kaal 0.3 · " + m.modelID + " · " + m.sessionID))
 	sb.WriteString("\n\n")
 	// The cast: the five Pandava agent blocks, each styled like the status
@@ -1504,6 +1538,7 @@ func (m *Model) closeModal(value any) {
 	case modalConnect:
 		if key, ok := value.(string); ok && strings.TrimSpace(key) != "" {
 			_ = config.SaveUserAPIKey(strings.TrimSpace(key))
+			m.applySavedKey()
 			m.appendNotice("api key saved")
 		}
 	case modalAgents:

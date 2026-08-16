@@ -6,6 +6,7 @@ package tui
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/kaal/kaal/internal/agents"
+	"github.com/kaal/kaal/internal/config"
 	"github.com/kaal/kaal/internal/gateway"
 	"github.com/kaal/kaal/internal/loop"
 	"github.com/kaal/kaal/internal/messages"
@@ -95,6 +97,47 @@ type testEnv struct {
 	gw       *fakeGateway
 	events   []tea.Msg
 	turnDone chan struct{} // buffered 1: one done signal per turn
+}
+
+func TestNewStartsWithoutAPIKey(t *testing.T) {
+	// kaal must start (workbench up) even when no API key resolves: the
+	// /connect path is how the key arrives. Only sending is blocked.
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config")
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	t.Setenv("HOME", dir)
+	t.Setenv("OPENCODE_API_KEY", "")
+
+	m, err := New(dir, 20, false)
+	if err != nil {
+		t.Fatalf("New must succeed without an API key: %v", err)
+	}
+	if !m.keyMissing {
+		t.Fatal("keyMissing should be set when no key resolves")
+	}
+	// Sending without a key must not start a turn (the typed text stays in
+	// the input; the error notice points at /connect).
+	if cmd := m.Submit("hi"); cmd != nil {
+		t.Fatal("Submit without a key must not start a turn")
+	}
+	if m.turnActive {
+		t.Fatal("turn must not be active without a key")
+	}
+	// /connect saves the key; applySavedKey makes it live on the gateway.
+	if err := config.SaveUserAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	m.applySavedKey()
+	if m.keyMissing {
+		t.Fatal("keyMissing should clear after /connect")
+	}
+	gw, ok := m.gateway.(*gateway.Gateway)
+	if !ok {
+		t.Fatalf("gateway type: %T", m.gateway)
+	}
+	if gw.APIKey != "sk-test" {
+		t.Fatalf("gateway key not updated: %q", gw.APIKey)
+	}
 }
 
 func setupTUI(t *testing.T, scripts ...[]gateway.StreamEvent) *testEnv {

@@ -25,7 +25,7 @@
 | `go build -o kaal ./cmd/kaal` | Build the static binary (CGO off for static: `CGO_ENABLED=0`) |
 | `go test -race ./...` | The full Go test suite |
 | `go vet ./...` | Vet the tree |
-| `kaal` | Launch the bubbletea TUI (default surface; needs API key) |
+| `kaal` | Launch the bubbletea TUI (default surface; starts keyless — `/connect <key>` adds a key) |
 | `kaal run "PROMPT"` | One-shot headless run; answer to stdout |
 | `kaal run --help` | All run flags |
 | `kaal sessions list` | List sessions as `<id> <ts> <prompt>` |
@@ -61,7 +61,7 @@
 
 **Exit codes:** `0` answer produced · `1` config/key/gateway/agent error · `2` loop error (max steps, context overflow, tool loop, 5 consecutive tool failures).
 
-**API key:** env `OPENCODE_API_KEY` → user key store `~/.config/kaal/api_key` (0600; saved from the TUI via `/connect`) → omp auth store `~/.omp/agent/agent.db` (read-only sqlite via modernc.org/sqlite — pure Go, no cgo) → exit 1 with instructions. Never cache or write it outside `config.SaveUserAPIKey`.
+**API key:** env `OPENCODE_API_KEY` → user key store `~/.config/kaal/api_key` (0600; saved from the TUI via `/connect`) → omp auth store `~/.omp/agent/agent.db` (read-only sqlite via modernc.org/sqlite — pure Go, no cgo). The TUI **starts keyless** (home screen hints `/connect`; sending is blocked until a key resolves) — only headless `kaal run`/`kaal doctor` exit 1 with instructions when missing. Never cache or write it outside `config.SaveUserAPIKey`.
 
 **Sessions:** each session is a JSONL record at `~/.local/share/kaal/sessions/` (override: env `KAAL_SESSIONS_DIR`). The id takes the form `%Y%m%d-%H%M%S-%f` (microseconds, spin-guarded against same-tick collisions — `internal/sessions`).
 

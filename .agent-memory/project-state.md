@@ -133,6 +133,9 @@ session: hi → ok
 ## 2026-08-17 — kaal update ported to the Go world
 `kaal update` was still Python-era after the migration: after `git pull` it pip-installed into `.venv` (nothing runs from there — the real binary was never rebuilt), and the git-less tarball path deleted live files (`docs/`, `AGENTS.md`, `.githooks`, `.gitignore`, `README.md`) then rebuilt a venv. Now: `rebuildCheckout` runs `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o kaal ./cmd/kaal` in the checkout (landing at `<checkout>/kaal`); the tarball overlay clears only `cmd/`+`internal/`; the git-less checkout marker is `go.mod` (was `pyproject.toml`); error messages point at README instead of install.sh. Release-fetch distribution remains the open follow-up.
 
+## 2026-08-17 — TUI starts keyless
+`tui.New()` no longer hard-fails when no API key resolves: the workbench starts (home screen hints `/connect <key>`), sending is blocked with a friendly error until a key exists, and `/connect` (inline or popup) pushes the saved key into the live gateway via `applySavedKey()` and clears the flag. Headless `kaal run`/`kaal doctor` still exit 1 with instructions. Test: `TestNewStartsWithoutAPIKey`.
+
 ## 2026-08-17 — release installers
 `install.sh` (curl) and `install.ps1` (irm) fetch the prebuilt `kaal-<os>-<arch>` release asset (latest by default, `KAAL_VERSION`/`$env:KAAL_VERSION` to pin), probe it with `--version`, and install to `~/.local/bin` / `%LOCALAPPDATA%\kaal`, adding the dir to PATH. install.sh verified end-to-end against the real v0.3 release (latest + pinned); the ps1 asset URLs resolve to valid PE32+ binaries (no pwsh on this machine to execute it). README has the curl/irm one-liners.
 
