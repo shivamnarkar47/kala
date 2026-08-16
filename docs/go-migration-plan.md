@@ -262,7 +262,7 @@ flowchart LR
 ```
 
 - **P0 — Chakra vyuha, the wheel (1 d).** The axle on which all else turns: `go.mod`
-  (Go 1.24), `cmd/kaal` stub with `--version` printing `kaal 0.1.0`, CI matrix
+  (Go 1.24), `cmd/kaal` stub with `--version` printing `kaal 0.3`, CI matrix
   (linux/macos/windows static builds), `install.sh`/`install.ps1` rewritten to fetch a
   release artifact, `kaal update` = release fetch. Python tree untouched; both camps
   stand side by side.
@@ -328,7 +328,7 @@ them before they fall. Each risk has its mitigation chained to it:
 
 ## 10. Deliverables checklist
 
-- [ ] `cmd/kaal` builds one static binary; `--version` = `kaal 0.1.0`
+- [ ] `cmd/kaal` builds one static binary; `--version` = `kaal 0.3`
 - [ ] dialect + messages table tests 100% green (ported from Python)
 - [ ] turn-2 request body byte-identical (reasoning replay golden test)
 - [ ] `kaal run` full flag/exit-code parity (0/1/2)

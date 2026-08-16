@@ -27,6 +27,17 @@ else
 fi
 
 # 3. Entry point proves the binary builds and reports the right version
-test "$(./.venv/bin/kaal --version)" = "kaal 0.1.0"
+test "$(./.venv/bin/kaal --version)" = "kaal 0.3"
+
+# 4. Go host (P0+): vet + build the whole tree and probe the version probe.
+#    Skipped with a warning when no Go toolchain is on PATH (mirrors the
+#    .venv guard above); the binary is left untracked by .gitignore.
+if command -v go >/dev/null 2>&1; then
+  (cd "$(dirname "$0")/.." && go vet ./... && go build ./... && \
+    test "$(go run ./cmd/kaal --version)" = "kaal 0.3")
+  echo "hooks: go build OK"
+else
+  echo "hooks: WARNING go not on PATH — skipping Go build check (commit proceeds)"
+fi
 
 echo "hooks: build check passed"

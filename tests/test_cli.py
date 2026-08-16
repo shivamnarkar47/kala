@@ -77,7 +77,7 @@ class TestCli(unittest.TestCase):
     def test_version(self):
         code, out, _ = self._run_cli(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("kaal 0.1.0", out)
+        self.assertIn("kaal 0.3", out)
 
     # -- sessions show ------------------------------------------------------
 

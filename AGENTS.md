@@ -69,7 +69,7 @@ When the epic voice and the skill's brevity rules conflict, the skill's shape wi
 | `kaal sessions delete <id>` | Delete one session |
 | `kaal sessions prune [--keep N]` | Delete all but the newest N sessions |
 | `kaal doctor` | Self-check: python, textual, api key, gateway, structure cache, sessions dir |
-| `kaal --version` | Print `kaal 0.1.0` and exit |
+| `kaal --version` | Print `kaal 0.3` and exit |
 | `kaal update` | Self-update: git pull + reinstall from the installer checkout (or `KAAL_INSTALL_DIR`) |
 | `kaal diagrams <file.mmd>` | Render a mermaid diagram as terminal Unicode art via termaid (optional: `pip install kaal[diagrams]`) |
 | `.venv/bin/python -m unittest discover -s tests -v` | All unit tests |
