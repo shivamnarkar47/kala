@@ -24,6 +24,32 @@ func TestBashShellSelection(t *testing.T) {
 	}
 }
 
+func TestResolveRelativeSymlinkedBase(t *testing.T) {
+	// Regression: a cwd whose prefix is a symlink (macOS /var -> /private/var)
+	// must not make in-project paths look like escapes — the base must be
+	// resolved the same way as the target.
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	target := filepath.Join(link, "a.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveRelative("a.txt", link)
+	if err != nil {
+		t.Fatalf("in-project path rejected through symlinked base: %v", err)
+	}
+	if got != filepath.Join(real, "a.txt") {
+		t.Fatalf("resolved %q, want %q", got, filepath.Join(real, "a.txt"))
+	}
+	// Escapes are still rejected.
+	if _, err := ResolveRelative("../outside", link); err == nil {
+		t.Fatal("escape must still be blocked")
+	}
+}
+
 func TestBashPathEnv(t *testing.T) {
 	dir := t.TempDir()
 	// A project venv must be picked up on both layouts (bin on unix,

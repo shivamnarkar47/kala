@@ -15,12 +15,23 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/kaal/kaal/internal/config"
 	"github.com/kaal/kaal/internal/sessions"
 )
+
+// skipOnWindows marks tests whose fake toolchain (#!/bin/sh scripts on
+// PATH) cannot execute on Windows; the real update/release paths are
+// exercised on the POSIX CI legs.
+func skipOnWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake POSIX toolchain scripts cannot execute on Windows")
+	}
+}
 
 // fakeSSEServer streams a fixed SSE script and records every request body.
 type fakeSSEServer struct {
@@ -514,6 +525,7 @@ func TestCompareVersions(t *testing.T) {
 }
 
 func TestUpdateReleaseFetchesAndSwaps(t *testing.T) {
+	skipOnWindows(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", "")
@@ -563,6 +575,7 @@ func TestUpdateReleaseFetchesAndSwaps(t *testing.T) {
 }
 
 func TestUpdateReleaseUpToDate(t *testing.T) {
+	skipOnWindows(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", "")
@@ -711,6 +724,7 @@ func TestRunMemoryRootFlag(t *testing.T) {
 }
 
 func TestUpdatePullsAndRebuilds(t *testing.T) {
+	skipOnWindows(t)
 	// A fake git checkout + fake git/go on PATH: update must pull, see a new
 	// commit, and rebuild the Go binary in the checkout.
 	home := t.TempDir()
@@ -757,6 +771,7 @@ esac
 }
 
 func TestUpdateUpToDate(t *testing.T) {
+	skipOnWindows(t)
 	home := t.TempDir()
 	checkout := filepath.Join(home, "checkout")
 	_ = os.MkdirAll(filepath.Join(checkout, ".git"), 0o755)
@@ -784,6 +799,7 @@ esac
 }
 
 func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
+	skipOnWindows(t)
 	// No git on PATH: update fetches the main-branch tarball from the URL
 	// seam and overlays it on the checkout; stale code dirs are cleared but
 	// live files (AGENTS.md, docs/) must survive.

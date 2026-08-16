@@ -50,11 +50,14 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: go build -trimpath -ldflags "-s -w -X github.com/kaal/kaal/internal/cli.version=${GITHUB_REF_NAME#v}" -o "kaal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/kaal
+      # Probe only when the binary can execute on this runner (native
+      # arch): a cross-compiled arm64 binary cannot run on an x64 runner.
       - name: Version probe
         shell: bash
+        if: ${{ (runner.arch == 'X64' && matrix.goarch == 'amd64') || (runner.arch == 'ARM64' && matrix.goarch == 'arm64') }}
         run: |
           BIN="./kaal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}"
-          test "$("$BIN" --version)" = "kaal ${GITHUB_REF_NAME#v}"
+          test "$("$BIN" --version | tr -d '\r')" = "kaal ${GITHUB_REF_NAME#v}"
       - uses: actions/upload-artifact@v4
         with:
           name: kaal-${{ matrix.goos }}-${{ matrix.goarch }}

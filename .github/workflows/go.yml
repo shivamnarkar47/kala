@@ -26,4 +26,4 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then BIN=./kaal.exe; else BIN=./kaal; fi
-          test "$("$BIN" --version)" = "kaal 0.3"
+          test "$("$BIN" --version | tr -d '\r')" = "kaal 0.3"

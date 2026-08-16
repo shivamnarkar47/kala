@@ -258,6 +258,13 @@ func ResolveRelative(p, cwd string) (string, error) {
 	if err != nil {
 		base = cwd
 	}
+	// Resolve the base's symlinks too, or the comparison is asymmetric: on
+	// platforms where a prefix of cwd is a symlink (macOS: /var ->
+	// /private/var) the resolved target below diverges from the lexical
+	// base and every in-project path looks like an escape.
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
 	joined := filepath.Join(base, filepath.FromSlash(p))
 	abs, err := filepath.Abs(joined)
 	if err != nil {
