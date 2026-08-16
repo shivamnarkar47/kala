@@ -126,3 +126,12 @@ session: Help me plan the next feature for this project. → ok
 
 ## 2026-08-16 — Go migration plan drafted
 `docs/go-migration-plan.md` proposes a full Go port on branch `docs/go-migration-plan`: bubbletea TUI, stdlib-only core (+ x/sync/errgroup), goroutine AgentLoop with `chan AgentEvent`, 7 phases ≈ 20 person-days, parity gate before Python tree removal. Status: proposal — no code touched. Revamped 2026-08-16 in the epic voice: seven vyuha formations (Chakra/Makara/Garuda/Kurma/Suchi/Padma/Krauncha) + the eighteenth-day parity gate; diagrams unchanged.
+
+## 2026-08-16 23:41
+session: hi → ok
+
+## 2026-08-17 — kaal update ported to the Go world
+`kaal update` was still Python-era after the migration: after `git pull` it pip-installed into `.venv` (nothing runs from there — the real binary was never rebuilt), and the git-less tarball path deleted live files (`docs/`, `AGENTS.md`, `.githooks`, `.gitignore`, `README.md`) then rebuilt a venv. Now: `rebuildCheckout` runs `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o kaal ./cmd/kaal` in the checkout (landing at `<checkout>/kaal`); the tarball overlay clears only `cmd/`+`internal/`; the git-less checkout marker is `go.mod` (was `pyproject.toml`); error messages point at README instead of install.sh. Release-fetch distribution remains the open follow-up.
+
+## 2026-08-17 — release-fetch update + Windows bash parity
+Both war-record open questions landed. `kaal update` now falls back to a prebuilt release binary when there is no git+go toolchain (or no checkout at all): fetch the `kaal-<goos>-<goarch>[.exe]` asset from the GitHub latest-release API, probe the downloaded binary with `--version`, compare dotted versions, and atomically swap the running executable. The `bash` tool runs `cmd.exe /C` with a `System32`-aware PATH on Windows (`/bin/sh -c` + POSIX dirs elsewhere; venv `Scripts`/`bin` both probed). Note: the repo has NO releases published yet — release-fetch reports a clear gap message until the first tag exists.

@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -887,18 +888,13 @@ func (r *Registry) toolBash(ctx context.Context, args map[string]any) string {
 		}
 	}
 	// Sanitized environment: keep the ambient env but restrict PATH to the
-	// project venv (when present) plus a minimal POSIX search path.
+	// project venv (when present) plus the platform's standard search dirs.
 	env := os.Environ()
-	pathDirs := []string{}
-	venvBin := filepath.Join(r.projectDir, ".venv", "bin")
-	if info, err := os.Stat(venvBin); err == nil && info.IsDir() {
-		pathDirs = append(pathDirs, venvBin)
-	}
-	pathDirs = append(pathDirs, "/usr/local/bin", "/usr/bin", "/bin")
-	env = append(env, "PATH="+strings.Join(pathDirs, string(os.PathListSeparator)))
+	env = append(env, "PATH="+bashPathEnv(r.projectDir))
 	cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", command)
+	shell, shellArg := bashShell()
+	cmd := exec.CommandContext(cmdCtx, shell, shellArg, command)
 	cmd.Dir = r.projectDir
 	cmd.Env = env
 	out, runErr := cmd.CombinedOutput()
@@ -909,6 +905,38 @@ func (r *Registry) toolBash(ctx context.Context, args map[string]any) string {
 		// Command exited non-zero: its output is still the result.
 	}
 	return capText(string(out))
+}
+
+// bashShell returns the shell invocation for the platform: cmd.exe /C on
+// Windows (there is no /bin/sh), /bin/sh -c everywhere else.
+func bashShell() (shell string, arg string) {
+	if runtime.GOOS == "windows" {
+		return "cmd.exe", "/C"
+	}
+	return "/bin/sh", "-c"
+}
+
+// bashPathEnv builds the sanitized PATH for the bash tool: the project venv
+// (Scripts on Windows, bin elsewhere) when present, plus the platform's
+// standard search dirs (System32 on Windows, the POSIX dirs elsewhere).
+func bashPathEnv(projectDir string) string {
+	pathDirs := []string{}
+	for _, v := range []string{
+		filepath.Join(projectDir, ".venv", "Scripts"),
+		filepath.Join(projectDir, ".venv", "bin"),
+	} {
+		if info, err := os.Stat(v); err == nil && info.IsDir() {
+			pathDirs = append(pathDirs, v)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if sr := os.Getenv("SystemRoot"); sr != "" {
+			pathDirs = append(pathDirs, filepath.Join(sr, "System32"), sr)
+		}
+	} else {
+		pathDirs = append(pathDirs, "/usr/local/bin", "/usr/bin", "/bin")
+	}
+	return strings.Join(pathDirs, string(os.PathListSeparator))
 }
 
 func (r *Registry) toolMemoryAppend(ctx context.Context, args map[string]any) string {

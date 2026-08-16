@@ -34,7 +34,7 @@
 | `kaal sessions prune [--keep N]` | Delete all but the newest N sessions |
 | `kaal doctor` | Self-check: go, terminal, api key, gateway, structure cache, sessions dir |
 | `kaal --version` | Print `kaal 0.3` and exit |
-| `kaal update` | Self-update: git pull + rebuild (or main-branch tarball overlay) |
+| `kaal update` | Self-update: git pull + rebuild, main-branch tarball overlay, or prebuilt release binary (no git/go needed) |
 | `kaal diagrams <file.mmd>` | Render a mermaid diagram as terminal Unicode art via termaid (`uv tool install termaid`) |
 | `git config core.hooksPath .githooks` | Enable build-check hooks: pre-commit & pre-push run gofmt + vet + `go test -race` + version probe; skip with `KAAL_SKIP_HOOKS=1` |
 
@@ -203,4 +203,4 @@ No memory dwells under `.kaal/`; everything there is regenerable cache or explic
 
 ## 9. The war record
 
-The Python camp (7,785 lines across 17 `harness/` modules) was ported formation by formation, tested table by table, and diffed on a 22-case parity corpus before being burned at the P7 gate. The plan of that campaign lives in `docs/go-migration-plan.md`; the gate instrument (self-skipping without a Python toolchain) lives in `internal/parity`. Open questions from the campaign that still want answers: release distribution for `kaal update` (currently git-pull/rebuild or tarball overlay; a release-fetch path is the natural follow-up), and Windows parity for the `bash` tool (currently `/bin/sh`-only).
+The Python camp (7,785 lines across 17 `harness/` modules) was ported formation by formation, tested table by table, and diffed on a 22-case parity corpus before being burned at the P7 gate. The plan of that campaign lives in `docs/go-migration-plan.md`; the gate instrument (self-skipping without a Python toolchain) lives in `internal/parity`. The campaign's open questions are answered as of 2026-08-17: `kaal update` gained a release-fetch path (GitHub Releases asset swap — no git checkout or Go toolchain needed; source paths remain when both exist), and the `bash` tool gained Windows parity (`cmd.exe /C` + `System32` PATH when `/bin/sh` is absent).

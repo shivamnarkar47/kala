@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,10 @@ import (
 	"github.com/kaal/kaal/internal/tui"
 )
 
-const version = "0.3"
+// version is stamped at release build time via
+// -ldflags "-X github.com/kaal/kaal/internal/cli.version=<tag>"; the
+// default keeps local/dev builds (and the version probe) honest.
+var version = "0.3"
 
 // The same UA the gateway sends (proven to pass Cloudflare WAF error 1010).
 const doctorUA = "python-requests/2.31.0"
@@ -53,6 +57,19 @@ const kaalRepoURL = "https://github.com/shivamnarkar47/kaal"
 
 // kaalUpdateURL is the git-less tarball endpoint (a seam for tests).
 var kaalUpdateURL = kaalRepoURL + "/archive/refs/heads/main.tar.gz"
+
+// kaalReleaseAPI is the GitHub latest-release endpoint (a seam for tests).
+var kaalReleaseAPI = "https://api.github.com/repos/shivamnarkar47/kaal/releases/latest"
+
+// updateExecutable is the binary release-fetch replaces — the running
+// executable by default, overridable in tests.
+var updateExecutable = func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
+}
 
 // Main is the CLI entry point; returns the process exit code. stdin/stdout/
 // stderr are injected so tests can capture everything.
@@ -747,7 +764,7 @@ func structureEntryCount(doc []byte) int {
 // resolveCheckout finds the kaal source checkout to update: the installer
 // dir first (KAAL_INSTALL_DIR, else ~/.local/share/kaal), then the repo the
 // running binary was launched from. A checkout counts with a .git dir OR a
-// pyproject.toml (the tarball install path has no git history).
+// go.mod (the tarball install path has no git history).
 func resolveCheckout() string {
 	envDir := os.Getenv("KAAL_INSTALL_DIR")
 	candidates := []string{}
@@ -760,7 +777,7 @@ func resolveCheckout() string {
 		}
 	}
 	for _, cand := range candidates {
-		if hasGitOrPyproject(cand) {
+		if hasGitOrGoMod(cand) {
 			return cand
 		}
 	}
@@ -780,11 +797,11 @@ func resolveCheckout() string {
 	return ""
 }
 
-func hasGitOrPyproject(dir string) bool {
+func hasGitOrGoMod(dir string) bool {
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		return true
 	}
-	_, err := os.Stat(filepath.Join(dir, "pyproject.toml"))
+	_, err := os.Stat(filepath.Join(dir, "go.mod"))
 	return err == nil
 }
 
@@ -814,17 +831,25 @@ func newUpdateCmd(stdout, stderr io.Writer) *cobra.Command {
 
 func runUpdate(stdout, stderr io.Writer) error {
 	checkout := resolveCheckout()
-	if checkout == "" {
-		fmt.Fprintln(stderr,
-			"kaal: no kaal checkout found — re-run install.sh, or set "+
-				"KAAL_INSTALL_DIR to the checkout")
-		return &exitError{code: 1}
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		// No git: do what install.sh's curl fallback does — fetch the
-		// main-branch tarball and overlay it on the checkout.
+	_, gitErr := exec.LookPath("git")
+	hasGit := gitErr == nil
+	_, goErr := exec.LookPath("go")
+	hasGo := goErr == nil
+	switch {
+	case checkout != "" && hasGit && hasGo:
+		// Source install with both tools: pull and rebuild in place.
+		return updateFromGit(checkout, stdout, stderr)
+	case checkout != "" && hasGo:
+		// Source install but no git: overlay the main-branch tarball and rebuild.
 		return updateTarball(checkout, stdout, stderr)
+	default:
+		// Binary install (no rebuildable checkout) or no Go toolchain:
+		// fetch the prebuilt release binary.
+		return updateFromRelease(stdout, stderr)
 	}
+}
+
+func updateFromGit(checkout string, stdout, stderr io.Writer) error {
 	before, err := runCmdOut("git", []string{"rev-parse", "--short", "HEAD"}, checkout)
 	if err != nil {
 		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
@@ -853,33 +878,36 @@ func runUpdate(stdout, stderr io.Writer) error {
 		return &exitError{code: 1}
 	}
 	fmt.Fprintf(stdout, "kaal updated: %s -> %s (%s)\n", before, after, subject)
-	fmt.Fprintln(stdout, "kaal rebuilt into .venv — restart kaal to use the new build.")
+	fmt.Fprintf(stdout, "kaal rebuilt at %s — restart kaal to use the new build.\n", filepath.Join(checkout, "kaal"))
 	return nil
 }
 
+// rebuildCheckout rebuilds the kaal binary from the checkout's Go source,
+// landing at <checkout>/kaal (the README build command, CGO off for static).
 func rebuildCheckout(checkout string, stderr io.Writer) bool {
-	venvPython := filepath.Join(checkout, ".venv", "bin", "python")
-	if _, err := os.Stat(venvPython); err != nil {
+	if _, err := exec.LookPath("go"); err != nil {
 		fmt.Fprintln(stderr,
-			"kaal: pulled, but no .venv in the checkout — re-run install.sh")
+			"kaal: pulled, but `go` is not on PATH — see README.md for build instructions")
 		return false
 	}
-	var err error
-	if _, lookErr := exec.LookPath("uv"); lookErr == nil {
-		_, err = runCmdOut("uv", []string{"pip", "install", "--python", venvPython, "."}, checkout)
-	} else {
-		_, err = runCmdOut(venvPython, []string{"-m", "pip", "install", "."}, checkout)
-	}
+	proc := exec.Command("go", "build", "-trimpath", "-ldflags", "-s -w", "-o", "kaal", "./cmd/kaal")
+	proc.Dir = checkout
+	proc.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := proc.CombinedOutput()
 	if err != nil {
-		fmt.Fprintf(stderr, "kaal: pulled, but rebuild failed: %v\n", err)
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		fmt.Fprintf(stderr, "kaal: pulled, but rebuild failed: %s\n", msg)
 		return false
 	}
 	return true
 }
 
 // updateTarball is the git-less update: fetch the main-branch tarball and
-// overlay it on the checkout (the .venv survives; stale code files are
-// cleared first so upstream deletions do not linger).
+// overlay it on the checkout (the running install survives; stale code dirs
+// are cleared first so upstream deletions do not linger).
 func updateTarball(checkout string, stdout, stderr io.Writer) error {
 	url := kaalUpdateURL
 	fmt.Fprintf(stdout, "kaal: fetching %s\n", url)
@@ -948,7 +976,10 @@ func updateTarball(checkout string, stdout, stderr io.Writer) error {
 		_, _ = io.Copy(f, tr)
 		f.Close()
 	}
-	for _, stale := range []string{"harness", "tests", "docs", "pyproject.toml", "README.md", "AGENTS.md", "install.sh", "install.ps1", ".gitignore", ".githooks"} {
+	// Only the code dirs are fully owned by the tarball; live files
+	// (AGENTS.md, docs/, .githooks, .gitignore, README.md) must never be
+	// deleted — upstream deletions there are non-fatal and linger safely.
+	for _, stale := range []string{"cmd", "internal"} {
 		path := filepath.Join(checkout, stale)
 		_ = os.RemoveAll(path)
 	}
@@ -972,7 +1003,7 @@ func updateTarball(checkout string, stdout, stderr io.Writer) error {
 		return &exitError{code: 1}
 	}
 	fmt.Fprintln(stdout, "kaal updated from the main tarball.")
-	fmt.Fprintln(stdout, "kaal rebuilt into .venv — restart kaal to use the new build.")
+	fmt.Fprintf(stdout, "kaal rebuilt at %s — restart kaal to use the new build.\n", filepath.Join(checkout, "kaal"))
 	return nil
 }
 
@@ -993,6 +1024,176 @@ func copyTree(src, dest string) error {
 		_ = os.MkdirAll(filepath.Dir(target), 0o755)
 		return os.WriteFile(target, raw, 0o644)
 	})
+}
+
+// -- release-fetch update -----------------------------------------------------------
+
+// releaseAssetName is the conventional release asset for this platform:
+// kaal-<goos>-<goarch> (with .exe on Windows).
+func releaseAssetName() string {
+	name := "kaal-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+// compareVersions orders dotted numeric versions ("0.3", "1.4.2"): -1, 0,
+// +1 when a is older, equal, or newer than b.
+func compareVersions(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		var x, y int
+		if i < len(as) {
+			x, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			y, _ = strconv.Atoi(bs[i])
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// updateFromRelease is the binary-install update: fetch the prebuilt
+// release binary for this platform from GitHub Releases, probe its version,
+// and atomically replace the running executable. It needs no git checkout
+// and no Go toolchain.
+func updateFromRelease(stdout, stderr io.Writer) error {
+	target := updateExecutable()
+	if target == "" {
+		fmt.Fprintln(stderr, "kaal: update failed: cannot locate the running kaal binary")
+		return &exitError{code: 1}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, kaalReleaseAPI, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	req.Header.Set("User-Agent", doctorUA)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintln(stderr,
+			"kaal: no release published yet — install from source (see README.md), "+
+				"or run `kaal update` with git and go on PATH")
+		return &exitError{code: 1}
+	}
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(stderr, "kaal: update failed: release endpoint returned HTTP %d\n", resp.StatusCode)
+		return &exitError{code: 1}
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(payload, &rel); err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: bad release metadata: %v\n", err)
+		return &exitError{code: 1}
+	}
+	asset := releaseAssetName()
+	url := ""
+	for _, a := range rel.Assets {
+		if a.Name == asset {
+			url = a.BrowserDownloadURL
+			break
+		}
+	}
+	if url == "" {
+		fmt.Fprintf(stderr, "kaal: release %s has no %s asset\n", rel.TagName, asset)
+		return &exitError{code: 1}
+	}
+	// Download into the target's directory so the final rename stays on one
+	// filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".kaal-update-*")
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	dlReq.Header.Set("User-Agent", doctorUA)
+	dlResp, err := http.DefaultClient.Do(dlReq)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusOK {
+		fmt.Fprintf(stderr, "kaal: update failed: asset download returned HTTP %d\n", dlResp.StatusCode)
+		return &exitError{code: 1}
+	}
+	if _, err := io.Copy(tmp, dlResp.Body); err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	if err := tmp.Close(); err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
+		return &exitError{code: 1}
+	}
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(tmpPath, 0o755)
+	}
+	// The downloaded binary must answer --version like a kaal before we swap
+	// it over the running executable.
+	fetched, err := probeVersion(tmpPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "kaal: update failed: downloaded binary is not a valid kaal: %v\n", err)
+		return &exitError{code: 1}
+	}
+	if compareVersions(fetched, version) <= 0 {
+		fmt.Fprintf(stdout, "kaal is up to date (%s).\n", version)
+		return nil
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		// Windows may refuse to rename over a running executable; fall back
+		// to remove-then-rename.
+		_ = os.Remove(target)
+		if err2 := os.Rename(tmpPath, target); err2 != nil {
+			fmt.Fprintf(stderr, "kaal: update failed: cannot replace %s: %v\n", target, err2)
+			return &exitError{code: 1}
+		}
+	}
+	fmt.Fprintf(stdout, "kaal updated: %s -> %s (%s).\n", version, fetched, rel.TagName)
+	fmt.Fprintln(stdout, "restart kaal to use the new build.")
+	return nil
+}
+
+// probeVersion runs <path> --version and returns the dotted version.
+func probeVersion(path string) (string, error) {
+	out, err := exec.Command(path, "--version").Output()
+	if err != nil {
+		return "", err
+	}
+	var v string
+	if _, err := fmt.Sscanf(string(out), "kaal %s", &v); err != nil || v == "" {
+		return "", fmt.Errorf("unexpected --version output %q", strings.TrimSpace(string(out)))
+	}
+	return v, nil
 }
 
 // -- diagrams ---------------------------------------------------------------------

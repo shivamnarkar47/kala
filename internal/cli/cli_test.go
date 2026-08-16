@@ -468,16 +468,138 @@ func TestDoctorFailsWithoutKey(t *testing.T) {
 	}
 }
 
-func TestUpdateNoCheckoutReportsError(t *testing.T) {
+func TestUpdateNoCheckoutFallsBackToRelease(t *testing.T) {
+	// A machine with no checkout (binary install) and no release published
+	// yet: update must reach the release-fetch path and report the gap.
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv("KAAL_INSTALL_DIR", "")
+	old := updateExecutable
+	updateExecutable = func() string { return filepath.Join(dir, "kaal") }
+	defer func() { updateExecutable = old }()
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	}))
+	defer apiSrv.Close()
+	oldAPI := kaalReleaseAPI
+	kaalReleaseAPI = apiSrv.URL
+	defer func() { kaalReleaseAPI = oldAPI }()
 	code, _, errOut := runMain(t, "", "update")
 	if code != 1 {
 		t.Fatalf("code %d", code)
 	}
-	if !strings.Contains(errOut, "no kaal checkout found") {
+	if !strings.Contains(errOut, "no release published yet") {
 		t.Fatalf("err: %q", errOut)
+	}
+}
+
+func TestCompareVersions(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"0.3", "0.4", -1},
+		{"0.4", "0.3", 1},
+		{"0.3", "0.3", 0},
+		{"0.10", "0.9", 1},
+		{"1.0", "0.99", 1},
+		{"0.3.1", "0.3", 1},
+		{"0.3", "0.3.0", 0},
+	}
+	for _, c := range cases {
+		if got := compareVersions(c.a, c.b); got != c.want {
+			t.Errorf("compareVersions(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestUpdateReleaseFetchesAndSwaps(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", "")
+	target := filepath.Join(home, "bin", "kaal")
+	_ = os.MkdirAll(filepath.Join(home, "bin"), 0o755)
+	_ = os.WriteFile(target, []byte("old binary\n"), 0o755)
+	old := updateExecutable
+	updateExecutable = func() string { return target }
+	defer func() { updateExecutable = old }()
+
+	// The release asset is an executable script that answers --version.
+	assetName := releaseAssetName()
+	assetBody := "#!/bin/sh\necho \"kaal 0.4\"\n"
+	assetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(assetBody))
+	}))
+	defer assetSrv.Close()
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		meta := fmt.Sprintf(`{"tag_name":"v0.4","assets":[{"name":"%s","browser_download_url":"%s"}]}`,
+			assetName, assetSrv.URL)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(meta))
+	}))
+	defer apiSrv.Close()
+	oldAPI := kaalReleaseAPI
+	kaalReleaseAPI = apiSrv.URL
+	defer func() { kaalReleaseAPI = oldAPI }()
+
+	code, out, errOut := runMain(t, "", "update")
+	if code != 0 {
+		t.Fatalf("code %d err %q", code, errOut)
+	}
+	if !strings.Contains(out, "kaal updated: 0.3 -> 0.4 (v0.4)") {
+		t.Fatalf("out: %q", out)
+	}
+	if !strings.Contains(out, "restart kaal") {
+		t.Fatalf("out: %q", out)
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != assetBody {
+		t.Fatalf("binary not swapped: %q", raw)
+	}
+}
+
+func TestUpdateReleaseUpToDate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", "")
+	target := filepath.Join(home, "bin", "kaal")
+	_ = os.MkdirAll(filepath.Join(home, "bin"), 0o755)
+	_ = os.WriteFile(target, []byte("old binary\n"), 0o755)
+	old := updateExecutable
+	updateExecutable = func() string { return target }
+	defer func() { updateExecutable = old }()
+
+	assetName := releaseAssetName()
+	assetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("#!/bin/sh\necho \"kaal 0.3\"\n"))
+	}))
+	defer assetSrv.Close()
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		meta := fmt.Sprintf(`{"tag_name":"v0.3","assets":[{"name":"%s","browser_download_url":"%s"}]}`,
+			assetName, assetSrv.URL)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(meta))
+	}))
+	defer apiSrv.Close()
+	oldAPI := kaalReleaseAPI
+	kaalReleaseAPI = apiSrv.URL
+	defer func() { kaalReleaseAPI = oldAPI }()
+
+	code, out, _ := runMain(t, "", "update")
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if !strings.Contains(out, "kaal is up to date (0.3)") {
+		t.Fatalf("out: %q", out)
+	}
+	raw, _ := os.ReadFile(target)
+	if string(raw) != "old binary\n" {
+		t.Fatal("target must be untouched when up to date")
 	}
 }
 
@@ -589,14 +711,12 @@ func TestRunMemoryRootFlag(t *testing.T) {
 }
 
 func TestUpdatePullsAndRebuilds(t *testing.T) {
-	// A fake git checkout + fake git/uv on PATH: update must pull, see a new
-	// commit, and rebuild into the checkout's .venv.
+	// A fake git checkout + fake git/go on PATH: update must pull, see a new
+	// commit, and rebuild the Go binary in the checkout.
 	home := t.TempDir()
 	checkout := filepath.Join(home, "checkout")
 	_ = os.MkdirAll(filepath.Join(checkout, ".git"), 0o755)
-	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(checkout, "go.mod"), []byte("module github.com/kaal/kaal\n"), 0o644)
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", checkout)
 
@@ -614,8 +734,9 @@ case "$1" in
 esac
 `
 	_ = os.WriteFile(filepath.Join(binDir, "git"), []byte(gitScript), 0o755)
-	uvScript := "#!/bin/sh\nexit 0\n"
-	_ = os.WriteFile(filepath.Join(binDir, "uv"), []byte(uvScript), 0o755)
+	// Fake go: a `build` invocation creates the binary in the checkout cwd.
+	goScript := "#!/bin/sh\ncase \"$1\" in\n  build) touch kaal ;;\nesac\n"
+	_ = os.WriteFile(filepath.Join(binDir, "go"), []byte(goScript), 0o755)
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 	t.Setenv("GIT_COUNT_FILE", countFile)
 	t.Setenv("FAKE_BEFORE", "abc123")
@@ -627,8 +748,11 @@ esac
 	if !strings.Contains(out, "abc123 -> def456 (the fake commit)") {
 		t.Fatalf("out: %q", out)
 	}
-	if !strings.Contains(out, "restart kaal") {
+	if !strings.Contains(out, "rebuilt at "+filepath.Join(checkout, "kaal")) {
 		t.Fatalf("out: %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "kaal")); err != nil {
+		t.Fatal("Go binary not rebuilt in the checkout")
 	}
 }
 
@@ -636,8 +760,7 @@ func TestUpdateUpToDate(t *testing.T) {
 	home := t.TempDir()
 	checkout := filepath.Join(home, "checkout")
 	_ = os.MkdirAll(filepath.Join(checkout, ".git"), 0o755)
-	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "go.mod"), []byte("module github.com/kaal/kaal\n"), 0o644)
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", checkout)
 	binDir := filepath.Join(home, "bin")
@@ -662,15 +785,17 @@ esac
 
 func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
 	// No git on PATH: update fetches the main-branch tarball from the URL
-	// seam and overlays it on the checkout; .venv survives, stale code dirs
-	// are cleared.
+	// seam and overlays it on the checkout; stale code dirs are cleared but
+	// live files (AGENTS.md, docs/) must survive.
 	home := t.TempDir()
 	checkout := filepath.Join(home, "checkout")
-	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
-	_ = os.MkdirAll(filepath.Join(checkout, "harness"), 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, "harness", "old.py"), []byte("stale\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	_ = os.MkdirAll(checkout, 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "go.mod"), []byte("module github.com/kaal/kaal\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(checkout, "cmd"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "cmd", "old.go"), []byte("stale\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(checkout, "docs"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "docs", "keep.md"), []byte("keep\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(checkout, "AGENTS.md"), []byte("keep\n"), 0o644)
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", checkout)
 
@@ -686,7 +811,7 @@ func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	add("kaal-main/pyproject.toml", "[project]\n")
+	add("kaal-main/go.mod", "module github.com/kaal/kaal\n")
 	add("kaal-main/newfile.txt", "fresh\n")
 	_ = tw.Close()
 	_ = gz.Close()
@@ -700,10 +825,10 @@ func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
 	kaalUpdateURL = srv.URL
 	defer func() { kaalUpdateURL = old }()
 
-	// uv on PATH (the rebuild path), but NO git.
+	// go on PATH (the rebuild path), but NO git.
 	binDir := filepath.Join(home, "bin")
 	_ = os.MkdirAll(binDir, 0o755)
-	_ = os.WriteFile(filepath.Join(binDir, "uv"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(binDir, "go"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
 	t.Setenv("PATH", binDir)
 
 	code, out, errOut := runMain(t, "", "update")
@@ -713,15 +838,21 @@ func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
 	if !strings.Contains(out, "updated from the main tarball") {
 		t.Fatalf("out: %q", out)
 	}
-	// Overlaid files present; stale harness dir cleared; .venv survived.
+	if !strings.Contains(out, "rebuilt at "+filepath.Join(checkout, "kaal")) {
+		t.Fatalf("out: %q", out)
+	}
+	// Overlaid files present; stale cmd dir cleared; live files survived.
 	if _, err := os.Stat(filepath.Join(checkout, "newfile.txt")); err != nil {
 		t.Fatal("overlaid file missing")
 	}
-	if _, err := os.Stat(filepath.Join(checkout, "harness")); err == nil {
-		t.Fatal("stale harness dir must be cleared")
+	if _, err := os.Stat(filepath.Join(checkout, "cmd")); err == nil {
+		t.Fatal("stale cmd dir must be cleared")
 	}
-	if _, err := os.Stat(filepath.Join(checkout, ".venv", "bin", "python")); err != nil {
-		t.Fatal(".venv must survive")
+	if _, err := os.Stat(filepath.Join(checkout, "docs", "keep.md")); err != nil {
+		t.Fatal("docs must survive")
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "AGENTS.md")); err != nil {
+		t.Fatal("AGENTS.md must survive")
 	}
 }
 
@@ -729,7 +860,7 @@ func TestResolveCheckoutAcceptsGitlessTarballDir(t *testing.T) {
 	home := t.TempDir()
 	checkout := filepath.Join(home, "checkout")
 	_ = os.MkdirAll(checkout, 0o755)
-	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(checkout, "go.mod"), []byte("module github.com/kaal/kaal\n"), 0o644)
 	t.Setenv("HOME", home)
 	t.Setenv("KAAL_INSTALL_DIR", checkout)
 	if got := resolveCheckout(); got != checkout {

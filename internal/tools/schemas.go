@@ -114,11 +114,13 @@ var toolSpecs = []spec{
 	{
 		Name: "bash",
 		Description: "Run a shell command in the project directory and return combined stdout and stderr " +
-			"(capped at 10000 chars). Runs in a sanitized environment with a minimal PATH (the " +
-			"project `.venv/bin` when present, plus `/usr/local/bin`, `/usr/bin`, `/bin`). " +
-			"`timeout` defaults to 30 seconds and may not exceed 300. Destructive commands (rm -rf, " +
-			"git push, git reset --hard, git clean -f, mkfs, dd, fork bombs, `> /dev/sd*`) are " +
-			"blocked by policy unless the registry allows dangerous commands.",
+			"(capped at 10000 chars); runs via `/bin/sh -c` on unix and `cmd.exe /C` on Windows, in a " +
+			"sanitized environment with a minimal PATH (the project `.venv/bin` (or `.venv/Scripts` " +
+			"on Windows) when present, plus `/usr/local/bin`, `/usr/bin`, `/bin` on unix or " +
+			"`%SystemRoot%\\System32` on Windows). `timeout` defaults to 30 seconds and may not exceed " +
+			"300. Destructive commands (rm -rf, git push, git reset --hard, git clean -f, mkfs, dd, " +
+			"fork bombs, `> /dev/sd*`) are blocked by policy unless the registry allows dangerous " +
+			"commands.",
 		Parameters: obj([]string{"command"}, map[string]any{
 			"command": strProp("Shell command to run."),
 			"timeout": intProp("Seconds before the command is killed; defaults to 30, max 300."),
