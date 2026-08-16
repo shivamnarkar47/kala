@@ -156,6 +156,12 @@ func WithStructure(st *structure.StructureManager) Option {
 	return func(l *AgentLoop) { l.structure = st }
 }
 
+// WithSessionWriter routes session persistence through the async writer
+// (P6: flush-on-turn-end; nil keeps synchronous appends).
+func WithSessionWriter(w *sessions.AsyncWriter) Option {
+	return func(l *AgentLoop) { l.sessionWriter = w }
+}
+
 // WithContext sets the turn context (the TUI's hard-cancel seam: cancelling
 // it aborts the in-flight SSE stream and ends the turn with ErrCancelled).
 func WithContext(ctx context.Context) Option {
@@ -178,6 +184,7 @@ type AgentLoop struct {
 	agent          *prompts.Agent
 	askHandler     func(question string, options []string) string
 	ctx            context.Context
+	sessionWriter  *sessions.AsyncWriter
 
 	verifyCmd []string // from .kaal/hooks.json, read once at Run() start
 
@@ -265,10 +272,15 @@ func (l *AgentLoop) Run(task string, emit func(AgentEvent)) (string, error) {
 	if model := l.gateway.ModelID(); model != "" {
 		metaData["model"] = model
 	}
-	_ = sessions.AppendEvent(l.sessionID, map[string]any{"type": "meta", "data": metaData})
-	_ = sessions.AppendEvent(l.sessionID, map[string]any{"type": "user", "data": map[string]any{"content": task}})
+	l.appendSessionEvents(map[string]any{"type": "meta", "data": metaData})
+	l.appendSessionEvents(map[string]any{"type": "user", "data": map[string]any{"content": task}})
 
 	answer, err := l.stepLoop(emit)
+	// P6 flush-on-turn-end: the async writer drains before the caller reads
+	// the session store.
+	if l.sessionWriter != nil {
+		l.sessionWriter.Flush()
+	}
 	if err != nil {
 		if errors.Is(err, ErrCancelled) {
 			return "", err // quiet end: the TUI's Ctrl+C, not a failure
@@ -287,6 +299,16 @@ func (l *AgentLoop) Run(task string, emit func(AgentEvent)) (string, error) {
 	}
 	l.memory.RecordSessionSummary(task, "ok")
 	return answer, nil
+}
+
+// appendSessionEvents routes persistence through the async writer when
+// configured (nil keeps the synchronous store).
+func (l *AgentLoop) appendSessionEvents(events ...map[string]any) {
+	if l.sessionWriter != nil {
+		_ = l.sessionWriter.AppendEvents(l.sessionID, events)
+		return
+	}
+	_ = sessions.AppendEvents(l.sessionID, events)
 }
 
 // stepLoop drives one full turn per step until an answer is produced.
@@ -402,7 +424,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 	}
 
 	if len(calls) == 0 {
-		_ = sessions.AppendEvents(l.sessionID, sessionEvents)
+		l.appendSessionEvents(sessionEvents...)
 		return content, nil
 	}
 
@@ -413,7 +435,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 	l.tools.BeginBatch(callNames(calls), sig)
 	var err error
 	sessionEvents, err = l.executeMany(calls, emit, sessionEvents)
-	_ = sessions.AppendEvents(l.sessionID, sessionEvents)
+	l.appendSessionEvents(sessionEvents...)
 	return "", err
 }
 

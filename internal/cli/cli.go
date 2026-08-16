@@ -129,6 +129,11 @@ type runOptions struct {
 	noToolCache    bool
 	noVerify       bool
 	agent          string
+
+	// P6: one async session writer per process, shared across batch
+	// workers; batch workers also get their own gateway transport.
+	sessionWriter   *sessions.AsyncWriter
+	workerTransport bool
 }
 
 func newRunCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -174,6 +179,8 @@ func defaultWorkers() int {
 }
 
 func runCmd(cmd *cobra.Command, opts *runOptions, prompt string, stdout, stderr io.Writer) error {
+	opts.sessionWriter = sessions.NewAsyncWriter()
+	defer opts.sessionWriter.Close()
 	if prompt != "" && opts.batch != "" {
 		return argError(cmd, stderr, "argument --batch: not allowed with argument prompt")
 	}
@@ -201,6 +208,7 @@ func runCmd(cmd *cobra.Command, opts *runOptions, prompt string, stdout, stderr 
 		sessionID = sessions.NewSessionID()
 	}
 	record := runOne(prompt, opts, sessionID, stdout, stderr, nil)
+	opts.sessionWriter.Flush() // durable before the answer prints
 	if record.ErrorKind != "" {
 		if record.ErrorKind == "config" {
 			// GetAPIKey already printed its message; nothing to add.
@@ -311,6 +319,10 @@ func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io
 		baseURL = runGatewayBaseURL
 	}
 	gw := &gateway.Gateway{BaseURL: baseURL, APIKey: key, Model: modelID}
+	if opts.workerTransport {
+		// P6 §4.3: batch workers get a transport per worker goroutine.
+		gw.Opener = gateway.NewClientOpener()
+	}
 	agentLoop := loop.NewAgentLoop(gw, toolRegistry, mem, sessionID,
 		loop.WithMaxSteps(opts.maxSteps),
 		loop.WithAllowDangerous(opts.allowDangerous),
@@ -318,6 +330,7 @@ func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io
 		loop.WithEnableVerify(!opts.noVerify),
 		loop.WithAgent(agent),
 		loop.WithAskHandler(askHandler),
+		loop.WithSessionWriter(opts.sessionWriter),
 	)
 	toolCalls := 0
 	emit := func(ev loop.AgentEvent) {
@@ -453,6 +466,7 @@ func runBatch(opts *runOptions, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "Error: --workers must be at least 1")
 		return &exitError{code: 2}
 	}
+	opts.workerTransport = true
 	prompts, err := readBatchPrompts(opts.batch)
 	if err != nil {
 		fmt.Fprintf(stderr, "kaal: cannot read batch file: %v\n", err)
@@ -482,6 +496,7 @@ func runBatch(opts *runOptions, stdout, stderr io.Writer) error {
 		}(i)
 	}
 	wg.Wait()
+	opts.sessionWriter.Flush() // flush-on-turn-end across all tasks
 
 	counts := map[string]int{}
 	for _, record := range records {

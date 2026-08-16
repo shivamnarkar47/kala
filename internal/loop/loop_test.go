@@ -1614,3 +1614,39 @@ func TestSpawnParallelTaskRecursionLimit(t *testing.T) {
 		t.Fatal("nested parallel limit string not persisted")
 	}
 }
+
+func TestAsyncSessionWriterRoundTrip(t *testing.T) {
+	turn1 := []gateway.StreamEvent{
+		reasoningEv("Let me check the directory"),
+		contentEv(dsmlWrite),
+		contentEv("I will write the file. "),
+		doneEv("tool_calls"),
+	}
+	turn2 := []gateway.StreamEvent{contentEv("Wrote hello.txt."), doneEv("stop")}
+	gw := newFakeGateway(turn1, turn2)
+	env := setup(t)
+	writer := sessions.NewAsyncWriter()
+	defer writer.Close()
+	l := agentLoop(t, gw, env.realTools(), env.mem, env.sessionID, loop.WithSessionWriter(writer))
+	answer, err := l.Run("Write the file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != "Wrote hello.txt." {
+		t.Fatalf("answer: %q", answer)
+	}
+	// Flush-on-turn-end: the session store is durable the moment Run returns.
+	replay := sessions.LoadMessages(env.sessionID)
+	if len(replay) == 0 {
+		t.Fatal("session not persisted through the async writer")
+	}
+	foundAssistant := false
+	for _, m := range replay {
+		if m["role"] == "assistant" && m["reasoning_content"] == "Let me check the directory" {
+			foundAssistant = true
+		}
+	}
+	if !foundAssistant {
+		t.Fatalf("assistant turn missing from replay: %v", replay)
+	}
+}

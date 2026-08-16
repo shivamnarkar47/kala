@@ -5,6 +5,7 @@ package sessions
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,6 +69,18 @@ type Event struct {
 	Data map[string]any `json:"data"`
 }
 
+// ValidateEvents checks every event's type without writing (the shared
+// synchronous gate for AppendEvents and the AsyncWriter).
+func ValidateEvents(events []map[string]any) error {
+	for _, event := range events {
+		etype, _ := event["type"].(string)
+		if !validTypes[etype] {
+			return &InvalidTypeError{Type: etype}
+		}
+	}
+	return nil
+}
+
 // AppendEvents appends N events as JSON lines in one open/write/close
 // cycle. Every event is validated before the file is touched; an invalid
 // type returns an error with nothing written. An empty list is a no-op.
@@ -75,12 +88,12 @@ func AppendEvents(sessionID string, events []map[string]any) error {
 	if len(events) == 0 {
 		return nil
 	}
+	if err := ValidateEvents(events); err != nil {
+		return err
+	}
 	records := make([]Event, 0, len(events))
 	for _, event := range events {
 		etype, _ := event["type"].(string)
-		if !validTypes[etype] {
-			return &InvalidTypeError{Type: etype}
-		}
 		data, _ := event["data"].(map[string]any)
 		if data == nil {
 			data = map[string]any{}
@@ -106,6 +119,72 @@ func AppendEvents(sessionID string, events []map[string]any) error {
 		}
 	}
 	return nil
+}
+
+// AsyncWriter is the P6 asynchronous session store: appends are enqueued to
+// a single writer goroutine (serializing file writes across batch workers —
+// no file-open contention) and flushed on turn end. Validation still happens
+// synchronously at enqueue time, so an invalid type is never written.
+type AsyncWriter struct {
+	ch   chan appendRequest
+	done chan struct{}
+	wg   sync.WaitGroup // pending appends
+}
+
+type appendRequest struct {
+	sessionID string
+	events    []map[string]any
+}
+
+// NewAsyncWriter starts a writer goroutine (one per process: the CLI shares
+// it across --batch workers).
+func NewAsyncWriter() *AsyncWriter {
+	w := &AsyncWriter{ch: make(chan appendRequest, 256), done: make(chan struct{})}
+	go w.loop()
+	return w
+}
+
+func (w *AsyncWriter) loop() {
+	for {
+		select {
+		case req := <-w.ch:
+			_ = AppendEvents(req.sessionID, req.events)
+			w.wg.Done()
+		case <-w.done:
+			return
+		}
+	}
+}
+
+// AppendEvents validates synchronously and enqueues the append.
+func (w *AsyncWriter) AppendEvents(sessionID string, events []map[string]any) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if err := ValidateEvents(events); err != nil {
+		return err
+	}
+	w.wg.Add(1)
+	select {
+	case w.ch <- appendRequest{sessionID: sessionID, events: events}:
+		return nil
+	case <-w.done:
+		w.wg.Done()
+		return errors.New("session writer closed")
+	}
+}
+
+// Flush blocks until every enqueued append is written (flush-on-turn-end).
+func (w *AsyncWriter) Flush() { w.wg.Wait() }
+
+// Close stops the writer goroutine. Call Flush first; pending appends are
+// dropped otherwise.
+func (w *AsyncWriter) Close() {
+	select {
+	case <-w.done:
+	default:
+		close(w.done)
+	}
 }
 
 // AppendEvent appends one event as a JSON line (thin wrapper).

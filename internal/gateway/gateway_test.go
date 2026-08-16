@@ -520,3 +520,44 @@ func TestContextCancelStopsRetries(t *testing.T) {
 // -- helpers ------------------------------------------------------------------
 
 func strptr(s string) *string { return &s }
+
+func TestTransportTuning(t *testing.T) {
+	op := NewClientOpener()
+	hc, ok := op.(*httpClientOpener)
+	if !ok {
+		t.Fatalf("NewClientOpener must return the pooled transport, got %T", op)
+	}
+	if hc.tr.MaxConnsPerHost != 4 || hc.tr.MaxIdleConnsPerHost != 4 || hc.tr.MaxIdleConns != 8 {
+		t.Fatalf("pool tuning: MaxConnsPerHost=%d MaxIdleConnsPerHost=%d MaxIdleConns=%d",
+			hc.tr.MaxConnsPerHost, hc.tr.MaxIdleConnsPerHost, hc.tr.MaxIdleConns)
+	}
+	if hc.tr.IdleConnTimeout != 90*time.Second {
+		t.Fatalf("idle timeout: %v", hc.tr.IdleConnTimeout)
+	}
+}
+
+func TestPerWorkerOpenersAreIsolated(t *testing.T) {
+	// P6 §4.3: batch workers each get their own transport — two openers must
+	// not share a transport.
+	a := NewClientOpener().(*httpClientOpener)
+	b := NewClientOpener().(*httpClientOpener)
+	if a.tr == b.tr {
+		t.Fatal("per-worker openers must not share a transport")
+	}
+}
+
+func TestGatewayOpenerOverride(t *testing.T) {
+	// The Gateway.Opener field wins over the package default (batch workers).
+	opener := &fakeOpener{responses: []func() (*http.Response, error){resp(200, nil, successSSE)}}
+	urlOpen = &fakeOpener{responses: []func() (*http.Response, error){respErr(errors.New("default opener must not be used"))}}
+	defer setTransport()
+	g := newGateway()
+	g.Opener = opener
+	events := collect(t, g.Stream(context.Background(), []any{map[string]any{"role": "user", "content": "hi"}}, nil, 0))
+	if len(events) != 2 || events[0].Kind != EventContent {
+		t.Fatalf("events: %+v", events)
+	}
+	if opener.calls != 1 {
+		t.Fatalf("opener calls: %d", opener.calls)
+	}
+}

@@ -19,6 +19,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -528,23 +530,25 @@ func grepRG(pattern, root string, caseSensitive bool, projectDir string) (string
 }
 
 // grepPython is the reference pure-Go grep scan; also the rg fallback.
+//
+// P6: files are scanned in parallel (≤4 workers) while the join stays
+// deterministic — results are collected per file in walk order, the shared
+// atomic cap stops NEW file scans once the budget is spent, and the final
+// join re-applies the cap in walk order, so the observable contract is
+// unchanged: post-cap files never appear in the result.
 func grepPython(pattern, root string, caseSensitive bool, projectDir string) string {
 	re, err := regexp.Compile(pattern)
-	if err != nil {
-		re, err = regexp.Compile("(?i)" + pattern)
-		if err == nil {
-			// keep the case-insensitive compile below
-		}
-	}
 	if !caseSensitive {
 		re, err = regexp.Compile("(?i)" + pattern)
 	}
 	if err != nil {
 		return fmt.Sprintf("grep: invalid regex %q: %s", pattern, err)
 	}
-	var matches []string
-	totalChars := 0
-	scanErr := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	// Walk first, collecting files in deterministic order (noise dirs
+	// skipped; the entry cap is not applied — grep scans everything below
+	// the root, like the Python fallback).
+	var files []string
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -554,42 +558,80 @@ func grepPython(pattern, root string, caseSensitive bool, projectDir string) str
 			}
 			return nil
 		}
-		f, err := os.Open(p)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-		lineno := 0
-		for scanner.Scan() {
-			lineno++
-			line := scanner.Text()
-			if re.MatchString(line) {
-				rel, _ := filepath.Rel(projectDir, p)
-				entry := filepath.ToSlash(rel) + ":" + fmt.Sprint(lineno) + ": " + strings.TrimRight(line, "\r\n")
-				if len(matches) > 0 {
-					totalChars++
-				}
-				totalChars += utf8.RuneCountInString(entry)
-				matches = append(matches, entry)
-				if totalChars > MaxResultChars {
-					return errCap
-				}
-			}
-		}
+		files = append(files, p)
 		return nil
 	})
-	if scanErr == errCap {
-		return capText(strings.Join(matches, "\n"))
+
+	results := make([][]string, len(files))
+	var total atomic.Int64
+	var capped atomic.Bool
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i, file := range files {
+		wg.Add(1)
+		go func(i int, file string) {
+			defer wg.Done()
+			if capped.Load() {
+				return // the budget is spent: don't start new scans
+			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if capped.Load() {
+				return
+			}
+			results[i] = scanFileForGrep(file, re, projectDir, &total, &capped)
+		}(i, file)
 	}
-	if scanErr != nil {
-		return fmt.Sprintf("grep: %s", scanErr)
+	wg.Wait()
+
+	// Join in walk order; truncate at the cap (the authoritative cut).
+	var matches []string
+	totalChars := 0
+	for _, entries := range results {
+		for _, entry := range entries {
+			if len(matches) > 0 {
+				totalChars++ // the "\n" separator
+			}
+			totalChars += utf8.RuneCountInString(entry)
+			if totalChars > MaxResultChars {
+				return capText(strings.Join(matches, "\n"))
+			}
+			matches = append(matches, entry)
+		}
 	}
 	if len(matches) == 0 {
 		return "no matches for " + pattern
 	}
 	return capText(strings.Join(matches, "\n"))
+}
+
+// scanFileForGrep scans one file, collecting matching lines as
+// 'relpath:lineno: text'; stops mid-file once the shared cap is spent.
+func scanFileForGrep(file string, re *regexp.Regexp, projectDir string, total *atomic.Int64, capped *atomic.Bool) []string {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	rel, _ := filepath.Rel(projectDir, file)
+	var entries []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	lineno := 0
+	for scanner.Scan() {
+		lineno++
+		line := scanner.Text()
+		if !re.MatchString(line) {
+			continue
+		}
+		entry := filepath.ToSlash(rel) + ":" + fmt.Sprint(lineno) + ": " + strings.TrimRight(line, "\r\n")
+		entries = append(entries, entry)
+		if total.Add(int64(utf8.RuneCountInString(entry)+1)) > MaxResultChars {
+			capped.Store(true)
+			break
+		}
+	}
+	return entries
 }
 
 var errCap = errors.New("cap reached")

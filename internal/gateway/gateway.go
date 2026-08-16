@@ -57,13 +57,13 @@ func (e *HTTPStatusError) Error() string {
 
 // -- transport ---------------------------------------------------------------
 
-// opener is the transport seam Gateway.stream() calls; tests swap it (the
+// Opener is the transport seam Gateway.stream() calls; tests swap it (the
 // analogue of Python's module-level _urlopen).
-type opener interface {
+type Opener interface {
 	Do(req *http.Request, timeout time.Duration) (*http.Response, error)
 }
 
-var urlOpen opener
+var urlOpen Opener
 
 // sleepFn is the retry-backoff seam; tests swap it to record sleeps. Returns
 // false when the context is cancelled during the wait.
@@ -103,12 +103,23 @@ type httpClientOpener struct {
 func newClientOpener() *httpClientOpener {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = config.RequestTimeout * time.Second
+	// Pool tuning (P6): bounded per-host concurrency and idle reuse — the
+	// Python per-thread socket juggling disappears entirely.
+	tr.MaxConnsPerHost = 4
+	tr.MaxIdleConns = 8
+	tr.MaxIdleConnsPerHost = 4
+	tr.IdleConnTimeout = 90 * time.Second
 	if !keepaliveEnabled() {
 		// Python falls back to plain urllib (no connection reuse) here.
 		tr.DisableKeepAlives = true
 	}
 	return &httpClientOpener{tr: tr}
 }
+
+// NewClientOpener builds a fresh pooled transport. Batch workers get their
+// own per the plan §4.3 — one transport per worker goroutine, so a worker's
+// connection churn never disturbs the others.
+func NewClientOpener() Opener { return newClientOpener() }
 
 func (o *httpClientOpener) Do(req *http.Request, _ time.Duration) (*http.Response, error) {
 	return (&http.Client{Transport: o.tr}).Do(req)
@@ -316,6 +327,9 @@ type Gateway struct {
 	BaseURL string
 	APIKey  string
 	Model   string
+	// Opener overrides the transport seam (batch workers pass their own
+	// per-worker transport); nil = the package default.
+	Opener Opener
 }
 
 // ModelID returns the configured model id (the loop's Gateway seam).
@@ -417,7 +431,11 @@ func (g *Gateway) runAttempt(ctx context.Context, url string, body []byte, emit 
 	req.GetBody = func() (io.ReadCloser, error) { // lets the transport retry stale pooled connections
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
-	resp, err := urlOpen.Do(req, config.RequestTimeout*time.Second)
+	op := urlOpen
+	if g.Opener != nil {
+		op = g.Opener
+	}
+	resp, err := op.Do(req, config.RequestTimeout*time.Second)
 	if err != nil {
 		return err
 	}

@@ -361,3 +361,43 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+func TestAsyncWriterAppendsAndFlushes(t *testing.T) {
+	setup(t)
+	w := sessions.NewAsyncWriter()
+	defer w.Close()
+	events := []map[string]any{
+		{"type": "user", "data": map[string]any{"content": "hello"}},
+		{"type": "assistant", "data": map[string]any{"content": "hi"}},
+		{"type": "tool_result", "data": map[string]any{"tool_call_id": "c1", "content": "ok"}},
+	}
+	for range 3 {
+		if err := w.AppendEvents("20260802-000000-000100", events); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Flush()
+	got := sessions.ReadEvents("20260802-000000-000100")
+	if len(got) != 9 {
+		t.Fatalf("want 9 events after flush, got %d", len(got))
+	}
+	// Flush is idempotent and safe to call again.
+	w.Flush()
+}
+
+func TestAsyncWriterValidatesSynchronously(t *testing.T) {
+	setup(t)
+	w := sessions.NewAsyncWriter()
+	defer w.Close()
+	err := w.AppendEvents("20260802-000000-000101", []map[string]any{
+		{"type": "user", "data": map[string]any{"content": "ok"}},
+		{"type": "bogus", "data": map[string]any{}},
+	})
+	if err == nil {
+		t.Fatal("invalid type must error at enqueue time")
+	}
+	w.Flush()
+	if got := sessions.ReadEvents("20260802-000000-000101"); len(got) != 0 {
+		t.Fatalf("invalid batch must write nothing: %v", got)
+	}
+}
