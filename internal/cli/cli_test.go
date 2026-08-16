@@ -5,7 +5,9 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -655,5 +657,82 @@ esac
 	}
 	if !strings.Contains(out, "up to date (same123)") {
 		t.Fatalf("out: %q", out)
+	}
+}
+
+func TestUpdateTarballFallbackOverlaysAndRebuilds(t *testing.T) {
+	// No git on PATH: update fetches the main-branch tarball from the URL
+	// seam and overlays it on the checkout; .venv survives, stale code dirs
+	// are cleared.
+	home := t.TempDir()
+	checkout := filepath.Join(home, "checkout")
+	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.MkdirAll(filepath.Join(checkout, "harness"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "harness", "old.py"), []byte("stale\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", checkout)
+
+	// Build the fake main-branch tarball: top dir + files.
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	add := func(name, content string) {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("kaal-main/pyproject.toml", "[project]\n")
+	add("kaal-main/newfile.txt", "fresh\n")
+	_ = tw.Close()
+	_ = gz.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+	old := kaalUpdateURL
+	kaalUpdateURL = srv.URL
+	defer func() { kaalUpdateURL = old }()
+
+	// uv on PATH (the rebuild path), but NO git.
+	binDir := filepath.Join(home, "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+	_ = os.WriteFile(filepath.Join(binDir, "uv"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	t.Setenv("PATH", binDir)
+
+	code, out, errOut := runMain(t, "", "update")
+	if code != 0 {
+		t.Fatalf("code %d err %q", code, errOut)
+	}
+	if !strings.Contains(out, "updated from the main tarball") {
+		t.Fatalf("out: %q", out)
+	}
+	// Overlaid files present; stale harness dir cleared; .venv survived.
+	if _, err := os.Stat(filepath.Join(checkout, "newfile.txt")); err != nil {
+		t.Fatal("overlaid file missing")
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "harness")); err == nil {
+		t.Fatal("stale harness dir must be cleared")
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".venv", "bin", "python")); err != nil {
+		t.Fatal(".venv must survive")
+	}
+}
+
+func TestResolveCheckoutAcceptsGitlessTarballDir(t *testing.T) {
+	home := t.TempDir()
+	checkout := filepath.Join(home, "checkout")
+	_ = os.MkdirAll(checkout, 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", checkout)
+	if got := resolveCheckout(); got != checkout {
+		t.Fatalf("gitless checkout: %q", got)
 	}
 }

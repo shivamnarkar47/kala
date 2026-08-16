@@ -51,6 +51,9 @@ const doctorUA = "python-requests/2.31.0"
 // kaalRepoURL mirrors install.sh's KAAL_REPO_URL default.
 const kaalRepoURL = "https://github.com/shivamnarkar47/kaal"
 
+// kaalUpdateURL is the git-less tarball endpoint (a seam for tests).
+var kaalUpdateURL = kaalRepoURL + "/archive/refs/heads/main.tar.gz"
+
 // Main is the CLI entry point; returns the process exit code. stdin/stdout/
 // stderr are injected so tests can capture everything.
 func Main(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -878,7 +881,7 @@ func rebuildCheckout(checkout string, stderr io.Writer) bool {
 // overlay it on the checkout (the .venv survives; stale code files are
 // cleared first so upstream deletions do not linger).
 func updateTarball(checkout string, stdout, stderr io.Writer) error {
-	url := kaalRepoURL + "/archive/refs/heads/main.tar.gz"
+	url := kaalUpdateURL
 	fmt.Fprintf(stdout, "kaal: fetching %s\n", url)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
