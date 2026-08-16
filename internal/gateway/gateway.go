@@ -315,8 +315,11 @@ func preview(body []byte) string {
 type Gateway struct {
 	BaseURL string
 	APIKey  string
-	ModelID string
+	Model   string
 }
+
+// ModelID returns the configured model id (the loop's Gateway seam).
+func (g *Gateway) ModelID() string { return g.Model }
 
 // Warm pre-opens the transport connection so the first Stream skips the
 // connect + TLS handshake. No-op in Go: the pooled transport opens the
@@ -338,7 +341,7 @@ func (g *Gateway) Stream(ctx context.Context, msgs []any, tools []any, maxTokens
 
 func (g *Gateway) stream(ctx context.Context, ch chan<- StreamEvent, msgs []any, tools []any, maxTokens int) {
 	defer close(ch)
-	body, err := jsonpy.Marshal(BuildBody(g.ModelID, msgs, tools, maxTokens))
+	body, err := jsonpy.Marshal(BuildBody(g.Model, msgs, tools, maxTokens))
 	if err != nil {
 		ch <- StreamEvent{Kind: EventError, Text: "gateway: marshal body: " + err.Error()}
 		return

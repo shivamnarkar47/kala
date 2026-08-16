@@ -124,7 +124,9 @@ func writeReflect(b *strings.Builder, rv reflect.Value) error {
 			b.WriteString("null")
 			return nil
 		}
-		return writeReflect(b, rv.Elem())
+		// Route through writeValue so scalar kinds (float64, string, …)
+		// keep their dedicated writers.
+		return writeValue(b, rv.Elem().Interface())
 	case reflect.Slice, reflect.Array:
 		b.WriteByte('[')
 		for i := 0; i < rv.Len(); i++ {

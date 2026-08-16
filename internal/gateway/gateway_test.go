@@ -24,7 +24,7 @@ import (
 )
 
 func newGateway() *Gateway {
-	return &Gateway{BaseURL: "https://example.test/v1", APIKey: "sk-test", ModelID: "deepseek-v4-flash"}
+	return &Gateway{BaseURL: "https://example.test/v1", APIKey: "sk-test", Model: "deepseek-v4-flash"}
 }
 
 func collect(t *testing.T, ch <-chan StreamEvent) []StreamEvent {
@@ -442,7 +442,7 @@ func TestKeepaliveTwoStreamsOneConnection(t *testing.T) {
 	// Two sequential streams must ride ONE pooled connection (the Python
 	// per-thread socket juggling disappears; the transport pools natively).
 	srv, conns := startCountingServer(t)
-	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", ModelID: "deepseek-v4-flash"}
+	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", Model: "deepseek-v4-flash"}
 	streamTwice(t, g)
 	if got := atomic.LoadInt32(conns); got != 1 {
 		t.Fatalf("want 1 connection for 2 streams, got %d", got)
@@ -455,7 +455,7 @@ func TestNoKeepaliveEnvUsesSeparateConnections(t *testing.T) {
 	setTransport()
 	defer setTransport()
 	srv, conns := startCountingServer(t)
-	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", ModelID: "deepseek-v4-flash"}
+	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", Model: "deepseek-v4-flash"}
 	streamTwice(t, g)
 	if got := atomic.LoadInt32(conns); got != 2 {
 		t.Fatalf("want 2 connections without keep-alive, got %d", got)
@@ -485,7 +485,7 @@ func TestStreamRetryThroughRealServer(t *testing.T) {
 		io.WriteString(w, "rate limited")
 	}))
 	defer srv.Close()
-	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", ModelID: "deepseek-v4-flash"}
+	g := &Gateway{BaseURL: srv.URL + "/v1", APIKey: "sk-test", Model: "deepseek-v4-flash"}
 	var sleeps []time.Duration
 	sleepFn = func(_ context.Context, d time.Duration) bool { sleeps = append(sleeps, d); return true }
 	defer func() { sleepFn = func(ctx context.Context, d time.Duration) bool { return true } }()

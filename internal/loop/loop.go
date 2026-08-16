@@ -59,6 +59,17 @@ func loopErr(format string, args ...any) *LoopError {
 	return &LoopError{msg: fmt.Sprintf(format, args...)}
 }
 
+// GatewayError is a gateway-level failure (stream error, retries exhausted,
+// 4xx). Exit code 1. It propagates WITHOUT a session summary, exactly like
+// Python's GatewayError escaping the loop.
+type GatewayError struct{ msg string }
+
+func (e *GatewayError) Error() string { return e.msg }
+
+func gatewayErr(format string, args ...any) *GatewayError {
+	return &GatewayError{msg: fmt.Sprintf(format, args...)}
+}
+
 // EventKind classifies one AgentEvent.
 type EventKind int
 
@@ -242,10 +253,13 @@ func (l *AgentLoop) Run(task string, emit func(AgentEvent)) (string, error) {
 
 	answer, err := l.stepLoop(emit)
 	if err != nil {
-		if emit != nil {
-			emit(AgentEvent{Kind: EventError, Text: err.Error()})
+		var le *LoopError
+		if errors.As(err, &le) {
+			if emit != nil {
+				emit(AgentEvent{Kind: EventError, Text: err.Error()})
+			}
+			l.memory.RecordSessionSummary(task, "error: "+err.Error())
 		}
-		l.memory.RecordSessionSummary(task, "error: "+err.Error())
 		return "", err
 	}
 	if emit != nil {
@@ -314,7 +328,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 			case gateway.EventToolCall:
 				structuredCalls = append(structuredCalls, ev.ToolCall)
 			case gateway.EventError:
-				return "", loopErr("gateway error: %s", ev.Text)
+				return "", gatewayErr("gateway error: %s", ev.Text)
 			case gateway.EventDone:
 				if ev.FinishReason != nil {
 					finishReason = *ev.FinishReason
