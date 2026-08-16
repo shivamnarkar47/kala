@@ -5,8 +5,12 @@ package sessions
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,10 +32,29 @@ func StoreDir() string {
 	return filepath.Join(home, ".local", "share", "kaal", "sessions")
 }
 
+var (
+	idMu      sync.Mutex
+	lastMicro string
+)
+
 // NewSessionID returns a session id unique to the microsecond:
-// %Y%m%d-%H%M%S-%f.
+// %Y%m%d-%H%M%S-%f (Python's strftime has no period; Go's "000000" layout
+// element only works after a '.', so the microseconds are appended by hand).
+// Go's time.Now() is fast enough that two calls can land in the same
+// microsecond tick (Python's datetime.now() call itself spans microseconds,
+// hiding the race there) — so the id spins until the clock advances,
+// keeping the format exact and the ids collision-free.
 func NewSessionID() string {
-	return time.Now().Format("20060102-150405-000000")
+	idMu.Lock()
+	defer idMu.Unlock()
+	for {
+		now := time.Now()
+		micro := now.Format("20060102-150405") + "-" + fmt.Sprintf("%06d", now.Nanosecond()/1000)
+		if micro != lastMicro {
+			lastMicro = micro
+			return micro
+		}
+	}
 }
 
 func sessionPath(sessionID string) string {
@@ -179,4 +202,96 @@ func LoadMessages(sessionID string) []map[string]any {
 		}
 	}
 	return out
+}
+
+// ListSessions returns every `<id>.jsonl` sorted by id: {"id", "ts",
+// "prompt"}. ts is the first event's timestamp (or nil), prompt the first
+// user event's content (or nil).
+func ListSessions() []map[string]any {
+	store := StoreDir()
+	entries, err := os.ReadDir(store)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			ids = append(ids, strings.TrimSuffix(e.Name(), ".jsonl"))
+		}
+	}
+	sort.Strings(ids)
+	var out []map[string]any
+	for _, id := range ids {
+		var firstTS, firstPrompt any
+		for _, record := range readRecords(filepath.Join(store, id+".jsonl")) {
+			if firstTS == nil {
+				if ts, ok := record["ts"].(string); ok && ts != "" {
+					firstTS = ts
+				}
+			}
+			if firstPrompt == nil && record["type"] == "user" {
+				if data, ok := record["data"].(map[string]any); ok {
+					if content, ok := data["content"].(string); ok && content != "" {
+						firstPrompt = content
+					}
+				}
+			}
+			if firstTS != nil && firstPrompt != nil {
+				break
+			}
+		}
+		out = append(out, map[string]any{"id": id, "ts": firstTS, "prompt": firstPrompt})
+	}
+	return out
+}
+
+// DeleteSession deletes `<store>/<id>.jsonl`; true if the file existed.
+// Only ever removes the session's own file.
+func DeleteSession(sessionID string) bool {
+	path := sessionPath(sessionID)
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
+// PruneSessions deletes all session files except the newest `keep`, sorted
+// by id. Returns the deleted session ids in deletion order. keep <= 0
+// deletes every session file.
+func PruneSessions(keep int) []string {
+	store := StoreDir()
+	entries, err := os.ReadDir(store)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			paths = append(paths, filepath.Join(store, e.Name()))
+		}
+	}
+	sort.Strings(paths)
+	limit := min(len(paths), max(0, len(paths)-keep))
+	var deleted []string
+	for _, p := range paths[:limit] {
+		if err := os.Remove(p); err != nil {
+			continue // vanished between listing and unlink; nothing to report
+		}
+		deleted = append(deleted, strings.TrimSuffix(filepath.Base(p), ".jsonl"))
+	}
+	return deleted
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

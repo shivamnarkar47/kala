@@ -26,6 +26,11 @@ func NewToolCache(path string) *ToolCache {
 	return &ToolCache{path: path, maxBytes: 4_000_000}
 }
 
+// NewToolCacheWithLimit builds a cache with an explicit size cap (tests).
+func NewToolCacheWithLimit(path string, maxBytes int64) *ToolCache {
+	return &ToolCache{path: path, maxBytes: maxBytes}
+}
+
 func (c *ToolCache) key(tool, argsJSON, signature string) string {
 	digest := sha256.Sum256([]byte(argsJSON))
 	return fmt.Sprintf("%s|%x|%s", tool, digest, signature)
