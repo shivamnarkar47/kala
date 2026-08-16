@@ -4,6 +4,29 @@
 Flash** with tools, persistent memory, sessions, and a bubbletea TUI. Core
 packages are stdlib-only.
 
+## Install
+
+Prebuilt binaries for every platform (`kaal-<os>-<arch>`) are attached to
+each GitHub Release:
+
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/shivamnarkar47/kaal/main/install.ps1 | iex
+```
+
+Both fetch the latest release binary, probe it with `--version`, and install
+it (`~/.local/bin/kaal` on unix, `%LOCALAPPDATA%\kaal\kaal.exe` on Windows).
+`kaal update` then self-updates the installed binary. Pin a version with
+`KAAL_VERSION=v0.3` / `$env:KAAL_VERSION`; choose a directory with
+`INSTALL_DIR` / `$env:INSTALL_DIR`.
+
+Or build from source:
+
 ```sh
 go build -o kaal ./cmd/kaal
 export OPENCODE_API_KEY=sk-...
@@ -13,7 +36,7 @@ export OPENCODE_API_KEY=sk-...
 
 ## Quick start
 
-1. **Build:** `go build -o kaal ./cmd/kaal` (or `go install github.com/kaal/kaal/cmd/kaal`).
+1. **Install:** the one-liner above (or `go build -o kaal ./cmd/kaal`).
 2. **Key:** the key is sought in order — env `OPENCODE_API_KEY`, then
    `~/.config/kaal/api_key` (saved from the TUI via `/connect`), then the omp
    auth store (`~/.omp/agent/agent.db`, read-only).
@@ -27,7 +50,7 @@ export OPENCODE_API_KEY=sk-...
 | `kaal run "PROMPT" [flags]` | one-shot headless run (flags: `--dir --model --max-steps --memory-root --allow-dangerous --resume --verbose --json --batch --workers --no-tool-cache --no-verify --agent`) |
 | `kaal sessions list\|show\|delete\|prune` | manage the JSONL session store |
 | `kaal doctor` | self-check (go, terminal, api key, gateway, structure cache, sessions) |
-| `kaal update` | self-update (git pull + rebuild, or main-branch tarball overlay) |
+| `kaal update` | self-update (git pull + rebuild, tarball overlay, or prebuilt release binary) |
 | `kaal diagrams <file.mmd>` | render mermaid as terminal art (needs `uv tool install termaid`) |
 
 Exit codes: `0` answer · `1` config/key/gateway error · `2` loop error.
