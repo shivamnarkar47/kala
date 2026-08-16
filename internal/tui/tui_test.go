@@ -119,7 +119,7 @@ func setupTUI(t *testing.T, scripts ...[]gateway.StreamEvent) *testEnv {
 		}
 	}
 	// Window size so rendering has real dimensions.
-	env.m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	env.m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
 	return env
 }
 
@@ -507,14 +507,16 @@ func TestSlashSuggestions(t *testing.T) {
 }
 
 func TestMermaidMissingTermaidNotice(t *testing.T) {
-	// A ```mermaid fence at turn end with termaid absent (PATH empty) lands
+	// A ```mermaid fence at turn end with termaid absent (PATH emptied) lands
 	// a notice instead of art.
+	t.Setenv("PATH", "")
 	env := setupTUI(t,
 		[]gateway.StreamEvent{contentEv("Here is the plan:\n\n```mermaid\nflowchart LR\nA --> B\n```\n"), doneEv("stop")},
 	)
 	env.runTurn(t, "draw")
-	// Drain again: the diagram worker sends its result after the turn.
-	deadline := time.Now().Add(5 * time.Second)
+	// Drain again: the diagram worker sends its result after the turn. The
+	// 20s guard absorbs -race ./... load (the render is sub-ms normally).
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		env.drain(t)
 		found := false
@@ -671,5 +673,36 @@ func TestAskModalRendersOptions(t *testing.T) {
 		}
 	default:
 		t.Fatal("answer never delivered")
+	}
+}
+
+func TestHomeBannerShowsOnFreshSession(t *testing.T) {
+	env := setupTUI(t)
+	// The visible window shows the theme's title, tagline, and first action.
+	view := plain(env.view())
+	for _, want := range []string{"KURUKSHETRA", "field of dharma", "ask a task", "kaal 0.3"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("home window missing %q in %q", want, view)
+		}
+	}
+	// The render pulls the Pandava cast from agentsState (covered by the
+	// agents tests); the wordmark + title are mirrored to the transcript once.
+	joined := strings.Join(env.m.transcript, "")
+	if !strings.Contains(joined, "KURUKSHETRA") {
+		t.Fatalf("transcript missing home: %q", joined)
+	}
+}
+
+func TestNewShowsHomeAgain(t *testing.T) {
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("answer\n"), doneEv("stop")},
+	)
+	env.runTurn(t, "hello")
+	if strings.Contains(plain(env.view()), "KURUKSHETRA") {
+		t.Fatal("home must hide during a conversation")
+	}
+	env.m.runCommand("/new")
+	if !strings.Contains(plain(env.view()), "KURUKSHETRA") {
+		t.Fatal("/new must return to the home banner")
 	}
 }

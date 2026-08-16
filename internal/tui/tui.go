@@ -56,6 +56,41 @@ const (
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// The homepage — Kurukshetra, the field of dharma. The chakra (the wheel of
+// the chariot's dharma), the KAAL wordmark, the five Pandava agents, and the
+// first actions.
+var (
+	chakraArt = `        ╔═══════════════╗
+      ╔═╝               ╚═╗
+     ╔╝                   ╚╗
+    ╔╝                     ╚╗
+    ║   ╔═══╗      ╔═══╗    ║
+    ║   ║   ║      ║   ║    ║
+    ║   ╚═╗ ╚═╦══╦═╝ ╔═╝    ║
+    ║     ║   ║  ║   ║      ║
+    ║   ╔═╝ ╔═╩══╩═╗ ╚═╗    ║
+    ║   ║   ║      ║   ║    ║
+    ║   ╚═══╝      ╚═══╝    ║
+    ╚╗                     ╔╝
+     ╚╗                   ╔╝
+      ╚═╗               ╔═╝
+        ╚═══════════════╝`
+
+	// The KAAL wordmark in block glyphs (ported from the Python camp's
+	// art.py) — the home-screen hero.
+	kaalArt = `▄▄▄   ▄▄▄             ▄▄                ▄▄▄
+███ ▄███▀             ██                ███            ▄▄
+███████   ▄█▀█▄ ▄█▀▀▀ ████▄  ▀▀█▄ ██ ██ ███      ▄███▄ ██ ▄█▀
+███▀███▄  ██▄█▀ ▀███▄ ██ ██ ▄█▀██ ██▄██ ███      ██ ██ ████
+███  ▀███ ▀█▄▄▄ ▄▄▄█▀ ██ ██ ▀█▄██  ▀█▀  ████████ ▀███▀ ██ ▀█▄`
+)
+
+const (
+	homeTitle   = "KURUKSHETRA"
+	homeTagline = "the field of dharma — where five Pandava agents take their stand, one mastermind at the reins"
+	homeWelcome = "ask a task, or /help for commands · ctrl+g invents an agent · /sessions resumes the past"
+)
+
 // AgentGeneratorSystemPrompt is the AI agent designer's system prompt
 // (verbatim from tui.py): the model answers with ONLY a JSON persona.
 const AgentGeneratorSystemPrompt = `You are an agent designer for a coding harness. The user describes an agent
@@ -207,6 +242,7 @@ type Model struct {
 	// mermaid auto-render + AI agent generator
 	diagramsEnabled bool
 	generatingAgent bool
+	homeMirrored    bool
 
 	// turn state
 	turnActive    bool
@@ -895,8 +931,46 @@ func (m *Model) renderMarkdown(text string) string {
 	return rendered
 }
 
+// renderHome renders the branded empty state: the chakra, the wordmark, the
+// title, the Pandava cast, and the first actions. Shown on a fresh session
+// (and after /new) — mirrored to the transcript once.
+func (m *Model) renderHome() {
+	var sb strings.Builder
+	sb.WriteString(m.dimStyle.Render(chakraArt))
+	sb.WriteString("\n")
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("79")).Render(kaalArt))
+	sb.WriteString("\n\n")
+	sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("222")).Render(homeTitle))
+	sb.WriteString("\n")
+	sb.WriteString(m.dimStyle.Render(homeTagline))
+	sb.WriteString("\n\n")
+	// The first actions sit right after the tagline so the welcome + session
+	// are in view even on short terminals (the cast below is decorative).
+	sb.WriteString(m.dimStyle.Render(homeWelcome))
+	sb.WriteString("\n")
+	sb.WriteString(m.dimStyle.Render("kaal 0.3 · " + m.modelID + " · " + m.sessionID))
+	sb.WriteString("\n\n")
+	// The cast: the five Pandava agent blocks, each styled like the status
+	// bar's agent segment.
+	for _, name := range agents.AgentNames(m.agentsState) {
+		sb.WriteString(m.agentStyle.Render(" " + name + " "))
+		sb.WriteString(" ")
+	}
+	m.viewport.SetContent(sb.String())
+	m.viewport.GotoTop()
+	if !m.homeMirrored {
+		m.homeMirrored = true
+		m.transcript = append(m.transcript, kaalArt, homeTitle, homeTagline)
+	}
+}
+
 // renderConversation rebuilds the viewport content from the blocks.
 func (m *Model) renderConversation() {
+	if len(m.blocks) == 0 && !m.turnActive {
+		m.renderHome()
+		return
+	}
+	m.homeMirrored = false
 	var sb strings.Builder
 	for _, b := range m.blocks {
 		switch b.kind {

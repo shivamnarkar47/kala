@@ -1680,10 +1680,17 @@ func TestCancelDuringAskAbortsWithoutPersisting(t *testing.T) {
 		_, err := l.Run("ask", nil)
 		result <- err
 	}()
-	// Wait until the ask handler is blocked inside the tool execution.
+	// Wait until the ask handler is blocked inside the tool execution. The
+	// guards are generous: under `go test -race ./...` (15 packages racing,
+	// each slowed ~10x by the detector) the sub-ms handshake can take longer.
 	select {
 	case <-called:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
+		select {
+		case err := <-result: // the run may have finished already
+			t.Fatalf("run ended before the handler was called: %v", err)
+		default:
+		}
 		t.Fatal("ask handler never called")
 	}
 	cancel()
@@ -1692,7 +1699,7 @@ func TestCancelDuringAskAbortsWithoutPersisting(t *testing.T) {
 		if !errors.Is(err, loop.ErrCancelled) {
 			t.Fatalf("want ErrCancelled, got %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("turn did not abort on cancel")
 	}
 	// The partial turn was NOT persisted (only meta + user from run start).
