@@ -7,6 +7,9 @@ const (
 	// catalog's 384k budget).
 	MaxOutputTokens = 32_000
 
+	// ContextWindow is the advertised model context window (tokens).
+	ContextWindow = 1_000_000
+
 	// ReasoningField is the delta field that carries streamed reasoning.
 	ReasoningField = "reasoning_content"
 

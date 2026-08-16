@@ -424,6 +424,13 @@ class TestKeepAliveTransport(unittest.TestCase):
                 with _serve() as server:
                     gateway = Gateway(server.base_url, "sk-test", "deepseek-v4-flash")
                     gateway.warm()
+                    # The client's connect() returns once the handshake completes,
+                    # but the server thread may not have incremented its accept
+                    # counter yet — wait for the count instead of racing it.
+                    for _ in range(100):
+                        if server.connections >= 1:
+                            break
+                        time.sleep(0.01)
                     self.assertEqual(server.connections, 1)
                     self.assertEqual(server.requests, 0)  # no request yet
                     msgs = [{"role": "user", "content": "hi"}]
