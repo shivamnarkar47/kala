@@ -136,10 +136,7 @@ func TestEntryCapNotesTruncation(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		_ = os.WriteFile(filepath.Join(root, "f"+itoa(i)+".txt"), []byte("x\n"), 0o644)
 	}
-	old := maxEntries
-	maxEntries = 10
-	defer func() { maxEntries = old }()
-	doc := NewStructureManager(root).Ensure()
+	doc := NewStructureManagerWithCap(root, 10).Ensure()
 	if !strings.Contains(doc, "structure truncated") {
 		t.Fatal("truncation notice missing")
 	}

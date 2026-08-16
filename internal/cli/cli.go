@@ -702,7 +702,13 @@ func apiKeySource() string {
 // reachable. Never sends the API key.
 func gatewayReachable() bool {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(doctorGatewayURL)
+	req, err := http.NewRequest(http.MethodGet, doctorGatewayURL, nil)
+	if err != nil {
+		return false
+	}
+	// The proven UA — Cloudflare WAF (error 1010) blocks default UAs.
+	req.Header.Set("User-Agent", doctorUA)
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -881,6 +887,8 @@ func updateTarball(checkout string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)
 		return &exitError{code: 1}
 	}
+	// The proven UA — Cloudflare WAF (error 1010) blocks default UAs.
+	req.Header.Set("User-Agent", doctorUA)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(stderr, "kaal: update failed: %v\n", err)

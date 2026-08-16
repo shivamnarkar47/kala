@@ -29,8 +29,9 @@ const (
 	sigPrefix = "<!-- sig: "
 )
 
-// maxEntries is a var (not const) so tests can lower the cap.
-var maxEntries = 20_000
+// maxEntriesDefault is the entry cap; a per-manager field (tests lower it
+// on their own manager, never a shared global).
+const maxEntriesDefault = 20_000
 
 // Entry is one walked entry: relpath (slash form), is-dir, size, mtime_ns.
 type Entry struct {
@@ -45,11 +46,20 @@ type Entry struct {
 type StructureManager struct {
 	Root          string
 	LastSignature string
+	maxEntries    int
 }
 
 func NewStructureManager(root string) *StructureManager {
 	abs, _ := filepath.Abs(root)
-	return &StructureManager{Root: abs}
+	return &StructureManager{Root: abs, maxEntries: maxEntriesDefault}
+}
+
+// NewStructureManagerWithCap builds a manager with an explicit entry cap
+// (tests).
+func NewStructureManagerWithCap(root string, cap int) *StructureManager {
+	m := NewStructureManager(root)
+	m.maxEntries = cap
+	return m
 }
 
 // CachePath is the cache document path.
@@ -110,7 +120,7 @@ func truncateRunes(s string, n int) string {
 
 // Scan builds the markdown document (tree + counts + signature comment).
 func (s *StructureManager) Scan() string {
-	entries := ordered(walk(s.Root))
+	entries := ordered(walk(s.Root, s.maxEntries))
 	files, dirs := 0, 0
 	for _, e := range entries {
 		if e.IsDir {
@@ -127,7 +137,7 @@ func (s *StructureManager) Scan() string {
 		"## Tree",
 	}
 	lines = append(lines, treeLines(entries)...)
-	if len(entries) >= maxEntries {
+	if len(entries) >= s.maxEntries {
 		lines = append(lines, "… (structure truncated: entry cap reached)")
 	}
 	if len(lines) > docMaxLines {
@@ -142,7 +152,7 @@ func (s *StructureManager) Scan() string {
 // honoring the caps. Dirs first (sorted, case-insensitive) then files, in
 // DFS order; a global entry cap stops the walk; dirs at the depth cap are
 // yielded but not descended into.
-func walk(root string) []Entry {
+func walk(root string, maxEntries int) []Entry {
 	var entries []Entry
 	count := 0
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -224,7 +234,7 @@ func ordered(entries []Entry) []Entry {
 // Signature returns the stable hash over (relpath, size, mtime_ns) of
 // non-noise entries.
 func (s *StructureManager) Signature() string {
-	return signatureFrom(ordered(walk(s.Root)))
+	return signatureFrom(ordered(walk(s.Root, s.maxEntries)))
 }
 
 // signatureFrom hashes (relpath, size, mtime_ns); relpath sorted

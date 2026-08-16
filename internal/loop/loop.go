@@ -239,7 +239,22 @@ func (l *AgentLoop) Run(task string, emit func(AgentEvent)) (string, error) {
 	if handler == nil {
 		handler = defaultAsk
 	}
-	l.tools.SetAskHandler(handler)
+	// Cancel-aware wrapper: a cancelled turn must not hang on a blocking
+	// ask handler (the TUI modal) — it answers "(cancelled)" instead, and
+	// the turn is discarded at the batch boundary below. base holds the
+	// ORIGINAL handler (the closure must not capture the reassigned var).
+	base := handler
+	wrapped := func(question string, options []string) string {
+		done := make(chan string, 1)
+		go func() { done <- base(question, options) }()
+		select {
+		case ans := <-done:
+			return ans
+		case <-l.ctx.Done():
+			return "(cancelled)"
+		}
+	}
+	l.tools.SetAskHandler(wrapped)
 
 	l.loadVerifyCmd()
 
@@ -435,8 +450,17 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 	l.tools.BeginBatch(callNames(calls), sig)
 	var err error
 	sessionEvents, err = l.executeMany(calls, emit, sessionEvents)
+	if l.ctx.Err() != nil {
+		// Cancelled: the partial turn's events are NOT persisted (Python's
+		// TurnCancelled discards the batch).
+		return "", ErrCancelled
+	}
+	if err != nil {
+		// Aborted (tool loop / 5 failures): the partial batch is discarded.
+		return "", err
+	}
 	l.appendSessionEvents(sessionEvents...)
-	return "", err
+	return "", nil
 }
 
 func reasonOrNil(reasoning string) any {

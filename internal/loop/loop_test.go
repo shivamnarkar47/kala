@@ -7,6 +7,7 @@ package loop_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1648,5 +1649,55 @@ func TestAsyncSessionWriterRoundTrip(t *testing.T) {
 	}
 	if !foundAssistant {
 		t.Fatalf("assistant turn missing from replay: %v", replay)
+	}
+}
+
+func TestCancelDuringAskAbortsWithoutPersisting(t *testing.T) {
+	// A cancelled turn with a blocked ask handler must answer
+	// "(cancelled)" and abort WITHOUT persisting the partial turn (Python's
+	// TurnCancelled discards the batch).
+	turn1 := []gateway.StreamEvent{
+		toolCallEv(messages.ToolCall{ID: "a1", Name: "ask_user", Arguments: `{"question": "Go?"}`}),
+		doneEv("tool_calls"),
+	}
+	gw := newFakeGateway(turn1)
+	env := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{})
+	l := agentLoop(t, gw, env.realTools(), env.mem, env.sessionID,
+		loop.WithContext(ctx),
+		loop.WithAskHandler(func(question string, options []string) string {
+			select {
+			case <-called:
+			default:
+				close(called)
+			}
+			<-called // block until the test's second close
+			return "yes"
+		}))
+	result := make(chan error, 1)
+	go func() {
+		_, err := l.Run("ask", nil)
+		result <- err
+	}()
+	// Wait until the ask handler is blocked inside the tool execution.
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ask handler never called")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, loop.ErrCancelled) {
+			t.Fatalf("want ErrCancelled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not abort on cancel")
+	}
+	// The partial turn was NOT persisted (only meta + user from run start).
+	replay := sessions.LoadMessages(env.sessionID)
+	if len(replay) != 1 || replay[0]["role"] != "user" {
+		t.Fatalf("partial turn must not persist: %v", replay)
 	}
 }
