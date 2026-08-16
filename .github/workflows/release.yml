@@ -80,4 +80,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          overwrite: true # re-tagged releases replace their assets
           generate_release_notes: true
