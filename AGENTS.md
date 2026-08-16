@@ -72,7 +72,7 @@ When the epic voice and the skill's brevity rules conflict, the skill's shape wi
 | `kaal --version` | Print `kaal 0.3` and exit |
 | `kaal update` | Self-update: git pull + reinstall from the installer checkout (or `KAAL_INSTALL_DIR`) |
 | `kaal diagrams <file.mmd>` | Render a mermaid diagram as terminal Unicode art via termaid (optional: `pip install kaal[diagrams]`) |
-| `.venv/bin/python -m unittest discover -s tests -v` | All unit tests |
+| `uv run python -m unittest discover -s tests -v` | All unit tests (uv is the toolchain; `.venv/bin/python` is the fallback) |
 | `git config core.hooksPath .githooks` | Enable build-check hooks: pre-commit & pre-push run compileall + unittest + `kaal --version`; skip with `KAAL_SKIP_HOOKS=1` |
 
 `kaal run -` reads the prompt from stdin in place of `"PROMPT"` — the route for piped input.

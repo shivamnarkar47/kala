@@ -14,12 +14,22 @@ if [ ! -f .venv/bin/python ]; then
   exit 0
 fi
 
+# Python interpreter in the project env: prefer uv (toolchain policy), fall
+# back to the .venv binary.
+if command -v uv >/dev/null 2>&1; then
+  PY="uv run python"
+  KAAL="uv run kaal"
+else
+  PY="./.venv/bin/python"
+  KAAL="./.venv/bin/kaal"
+fi
+
 # 1. Fast syntax/bytecode gate
-./.venv/bin/python -m compileall -q harness tests
+$PY -m compileall -q harness tests
 
 # 2. Full unit-test suite — fail the commit/push if it fails.
 #    pipefail makes the pipeline status reflect the test run, not `tail`.
-if ./.venv/bin/python -m unittest discover -s tests 2>&1 | tail -3; then
+if $PY -m unittest discover -s tests 2>&1 | tail -3; then
   echo "hooks: tests OK"
 else
   echo "hooks: tests FAILED" >&2
@@ -27,7 +37,7 @@ else
 fi
 
 # 3. Entry point proves the binary builds and reports the right version
-test "$(./.venv/bin/kaal --version)" = "kaal 0.3"
+test "$($KAAL --version)" = "kaal 0.3"
 
 # 4. Go host (P0+): vet + build the whole tree and probe the version probe.
 #    Skipped with a warning when no Go toolchain is on PATH (mirrors the
