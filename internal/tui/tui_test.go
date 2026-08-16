@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/kaal/kaal/internal/agents"
 	"github.com/kaal/kaal/internal/gateway"
 	"github.com/kaal/kaal/internal/loop"
 	"github.com/kaal/kaal/internal/messages"
@@ -455,4 +456,220 @@ func TestErrorRendersInConversation(t *testing.T) {
 
 func loopEvent(kind loop.EventKind, text string) turnEventMsg {
 	return turnEventMsg{ev: loop.AgentEvent{Kind: kind, Text: text}}
+}
+
+func TestTopbarHiddenByDefaultAndToggle(t *testing.T) {
+	env := setupTUI(t)
+	if env.m.topbarVisible {
+		t.Fatal("topbar must start hidden")
+	}
+	view := plain(env.view())
+	if strings.Contains(view, "KAAL") {
+		t.Fatalf("topbar must be hidden by default: %q", view)
+	}
+	env.m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	if !env.m.topbarVisible {
+		t.Fatal("ctrl+t must show the topbar")
+	}
+	view = plain(env.view())
+	if !strings.Contains(view, "KAAL") || !strings.Contains(view, "deepseek-v4-flash") {
+		t.Fatalf("topbar content missing: %q", view)
+	}
+}
+
+func TestSlashSuggestions(t *testing.T) {
+	env := setupTUI(t)
+	env.m.input.SetValue("/res")
+	env.m.updateSuggestions()
+	if !env.m.suggestionsVisible || len(env.m.suggestions) == 0 {
+		t.Fatal("suggestions must appear for /res")
+	}
+	found := false
+	for _, c := range env.m.suggestions {
+		if c == "/resume" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("suggestions: %v", env.m.suggestions)
+	}
+	// tab cycles + completes
+	env.m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if env.m.input.Value() == "" {
+		t.Fatal("tab must complete the suggestion")
+	}
+	// plain text hides the popup
+	env.m.input.SetValue("hello")
+	env.m.updateSuggestions()
+	if env.m.suggestionsVisible {
+		t.Fatal("suggestions must hide without a leading slash")
+	}
+}
+
+func TestMermaidMissingTermaidNotice(t *testing.T) {
+	// A ```mermaid fence at turn end with termaid absent (PATH empty) lands
+	// a notice instead of art.
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("Here is the plan:\n\n```mermaid\nflowchart LR\nA --> B\n```\n"), doneEv("stop")},
+	)
+	env.runTurn(t, "draw")
+	// Drain again: the diagram worker sends its result after the turn.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		env.drain(t)
+		found := false
+		for _, b := range env.m.blocks {
+			if b.kind == blockNotice && strings.Contains(b.text, "termaid") {
+				found = true
+			}
+		}
+		if found || time.Now().After(deadline) {
+			if !found {
+				t.Fatalf("termaid notice missing: %+v", env.m.blocks)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestDiagramsToggleOffSkipsRender(t *testing.T) {
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("```mermaid\nflowchart LR\nA --> B\n```\n"), doneEv("stop")},
+	)
+	env.m.diagramsEnabled = false
+	env.runTurn(t, "draw")
+	time.Sleep(50 * time.Millisecond)
+	env.drain(t)
+	for _, b := range env.m.blocks {
+		if b.kind == blockNotice && strings.Contains(b.text, "termaid") {
+			t.Fatalf("diagram rendered with diagrams off: %+v", env.m.blocks)
+		}
+	}
+}
+
+func TestModelsModalShowsPrices(t *testing.T) {
+	env := setupTUI(t)
+	env.m.runCommand("/models")
+	if env.m.modal == nil || env.m.modal.kind != modalModels {
+		t.Fatal("models modal not open")
+	}
+	view := plain(env.m.modalView())
+	if !strings.Contains(view, "deepseek-v4-flash") {
+		t.Fatalf("model missing: %q", view)
+	}
+	if !strings.Contains(view, "per M") {
+		t.Fatalf("price lines missing: %q", view)
+	}
+}
+
+func TestAgentsModalActivates(t *testing.T) {
+	env := setupTUI(t)
+	env.m.runCommand("/agents")
+	if env.m.modal == nil || env.m.modal.kind != modalAgents {
+		t.Fatal("agents modal not open")
+	}
+	found := false
+	for i, name := range env.m.modal.items {
+		if name == "Bhima" {
+			env.m.modal.cursor = i
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Bhima missing from agents: %v", env.m.modal.items)
+	}
+	env.m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if env.m.modal != nil {
+		t.Fatal("modal must close on enter")
+	}
+	if env.m.agent == nil || env.m.agent.Name != "Bhima" {
+		t.Fatalf("agent not activated: %+v", env.m.agent)
+	}
+	// Persisted.
+	state := agents.Load(env.m.projectDir)
+	if state.Active != "Bhima" {
+		t.Fatalf("persisted active: %q", state.Active)
+	}
+}
+
+func TestAgentGeneratorFlow(t *testing.T) {
+	// The generator streams a completion on the gateway: script it to reply
+	// with a JSON persona, then check it was added + activated + persisted.
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv(`{"name": "Karna", "description": "the relentless executor"}`), doneEv("stop")},
+	)
+	env.m.generateAgent("a loyal warrior", AgentGeneratorSystemPrompt, "generated and active")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		env.drain(t)
+		if !env.m.generatingAgent && strings.Contains(strings.Join(env.m.transcript, ""), "Karna") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("generator never landed: transcript %q", strings.Join(env.m.transcript, ""))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if env.m.agent == nil || env.m.agent.Name != "Karna" {
+		t.Fatalf("agent not activated: %+v", env.m.agent)
+	}
+	state := agents.Load(env.m.projectDir)
+	if state.Active != "Karna" {
+		t.Fatalf("persisted active: %q", state.Active)
+	}
+}
+
+func TestAgentGeneratorReentryGuarded(t *testing.T) {
+	env := setupTUI(t)
+	env.m.generatingAgent = true
+	env.m.generateAgent("another one", AgentGeneratorSystemPrompt, "x")
+	if !strings.Contains(strings.Join(env.m.transcript, ""), "already running") {
+		t.Fatalf("re-entry must be refused: %q", strings.Join(env.m.transcript, ""))
+	}
+}
+
+func TestAgentGeneratorUnparsableReply(t *testing.T) {
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("I cannot do that"), doneEv("stop")},
+	)
+	env.m.generateAgent("whatever", AgentGeneratorSystemPrompt, "x")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		env.drain(t)
+		if !env.m.generatingAgent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("generator never finished")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	joined := strings.Join(env.m.transcript, "")
+	if !strings.Contains(joined, "could not parse") {
+		t.Fatalf("parse-failure notice missing: %q", joined)
+	}
+}
+
+func TestAskModalRendersOptions(t *testing.T) {
+	env := setupTUI(t)
+	answerCh := make(chan string, 1)
+	env.m.Update(openAskMsg{question: "Proceed?", options: []string{"yes", "no"}, answerCh: answerCh})
+	if env.m.modal == nil || env.m.modal.kind != modalAsk {
+		t.Fatal("ask modal not open")
+	}
+	view := plain(env.m.modalView())
+	if !strings.Contains(view, "Proceed?") || !strings.Contains(view, "1. yes") || !strings.Contains(view, "2. no") {
+		t.Fatalf("ask modal content: %q", view)
+	}
+	// Number key picks an option.
+	env.m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	select {
+	case ans := <-answerCh:
+		if ans != "no" {
+			t.Fatalf("answer: %q", ans)
+		}
+	default:
+		t.Fatal("answer never delivered")
+	}
 }

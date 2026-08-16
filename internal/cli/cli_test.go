@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kaal/kaal/internal/config"
 	"github.com/kaal/kaal/internal/sessions"
 )
 
@@ -83,6 +84,9 @@ func setupCLI(t *testing.T, sse string, status int) (*fakeSSEServer, string) {
 	dir := t.TempDir()
 	t.Setenv("OPENCODE_API_KEY", "sk-test")
 	t.Setenv("KAAL_SESSIONS_DIR", filepath.Join(dir, "sessions"))
+	// Isolate the user config: tests must never touch the real key/model
+	// stores.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	f := newFakeSSEServer(t, sse, status)
 	old := runGatewayBaseURL
 	runGatewayBaseURL = f.server.URL
@@ -421,6 +425,9 @@ func TestDoctor(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("OPENCODE_API_KEY", "sk-test")
 	t.Setenv("KAAL_SESSIONS_DIR", filepath.Join(dir, "sessions"))
+	// Isolate the user config: tests must never touch the real key/model
+	// stores.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -524,5 +531,129 @@ func TestNoSubcommandNeedsTerminal(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "TUI needs a terminal") {
 		t.Fatalf("err: %q", errOut)
+	}
+}
+
+func TestRunUsesSavedDefaultModel(t *testing.T) {
+	f, dir := setupCLI(t, answerSSE, 200)
+	if err := config.SaveUserModel("kimi-k2.5"); err != nil {
+		t.Fatal(err)
+	}
+	code, _, _ := runMain(t, "", "run", "hi", "--dir", dir)
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(f.requests[0], &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Model != "kimi-k2.5" {
+		t.Fatalf("saved model not used: %q", body.Model)
+	}
+}
+
+func TestRunModelFlagWins(t *testing.T) {
+	f, dir := setupCLI(t, answerSSE, 200)
+	if err := config.SaveUserModel("kimi-k2.5"); err != nil {
+		t.Fatal(err)
+	}
+	code, _, _ := runMain(t, "", "run", "hi", "--dir", dir, "--model", "hy3")
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(f.requests[0], &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Model != "hy3" {
+		t.Fatalf("flag model not used: %q", body.Model)
+	}
+}
+
+func TestRunMemoryRootFlag(t *testing.T) {
+	_, dir := setupCLI(t, answerSSE, 200)
+	memRoot := filepath.Join(dir, "custom-memory")
+	code, _, _ := runMain(t, "", "run", "hi", "--dir", dir, "--memory-root", memRoot)
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(memRoot, "project-state.md")); err != nil {
+		t.Fatalf("memory root not used: %v", err)
+	}
+}
+
+func TestUpdatePullsAndRebuilds(t *testing.T) {
+	// A fake git checkout + fake git/uv on PATH: update must pull, see a new
+	// commit, and rebuild into the checkout's .venv.
+	home := t.TempDir()
+	checkout := filepath.Join(home, "checkout")
+	_ = os.MkdirAll(filepath.Join(checkout, ".git"), 0o755)
+	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[project]\n"), 0o644)
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", checkout)
+
+	binDir := filepath.Join(home, "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+	// Stateful fake git: the first rev-parse (before pull) reports
+	// FAKE_BEFORE, later ones FAKE_AFTER.
+	countFile := filepath.Join(home, "git-count")
+	gitScript := `#!/bin/sh
+case "$1" in
+  rev-parse)
+    if [ -f "$GIT_COUNT_FILE" ]; then echo "${FAKE_AFTER:-def456}"; else touch "$GIT_COUNT_FILE"; echo "${FAKE_BEFORE:-abc123}"; fi ;;
+  pull) exit 0 ;;
+  log) echo "the fake commit" ;;
+esac
+`
+	_ = os.WriteFile(filepath.Join(binDir, "git"), []byte(gitScript), 0o755)
+	uvScript := "#!/bin/sh\nexit 0\n"
+	_ = os.WriteFile(filepath.Join(binDir, "uv"), []byte(uvScript), 0o755)
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("GIT_COUNT_FILE", countFile)
+	t.Setenv("FAKE_BEFORE", "abc123")
+	t.Setenv("FAKE_AFTER", "def456")
+	code, out, errOut := runMain(t, "", "update")
+	if code != 0 {
+		t.Fatalf("code %d err %q", code, errOut)
+	}
+	if !strings.Contains(out, "abc123 -> def456 (the fake commit)") {
+		t.Fatalf("out: %q", out)
+	}
+	if !strings.Contains(out, "restart kaal") {
+		t.Fatalf("out: %q", out)
+	}
+}
+
+func TestUpdateUpToDate(t *testing.T) {
+	home := t.TempDir()
+	checkout := filepath.Join(home, "checkout")
+	_ = os.MkdirAll(filepath.Join(checkout, ".git"), 0o755)
+	_ = os.MkdirAll(filepath.Join(checkout, ".venv", "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(checkout, ".venv", "bin", "python"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	t.Setenv("HOME", home)
+	t.Setenv("KAAL_INSTALL_DIR", checkout)
+	binDir := filepath.Join(home, "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+	gitScript := `#!/bin/sh
+case "$1" in
+  rev-parse) echo "same123" ;;
+  pull) exit 0 ;;
+  log) echo "subject" ;;
+esac
+`
+	_ = os.WriteFile(filepath.Join(binDir, "git"), []byte(gitScript), 0o755)
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	code, out, _ := runMain(t, "", "update")
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if !strings.Contains(out, "up to date (same123)") {
+		t.Fatalf("out: %q", out)
 	}
 }

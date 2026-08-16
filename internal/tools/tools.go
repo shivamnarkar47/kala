@@ -20,7 +20,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -468,10 +467,13 @@ func formatRGLine(line string) string {
 	return pathPart + ":" + lineno + ": " + text
 }
 
+// RgLookup is the rg-detection seam (tests force the pure-Go fallback).
+var RgLookup = exec.LookPath
+
 // grepRG is the rg-backed grep; ok=false means "fall back". Streams rg's
 // stdout so scanning stops as soon as the result reaches the cap.
 func grepRG(pattern, root string, caseSensitive bool, projectDir string) (string, bool) {
-	if _, err := exec.LookPath("rg"); err != nil {
+	if _, err := RgLookup("rg"); err != nil {
 		return "", false
 	}
 	relRoot, err := filepath.Rel(projectDir, root)
@@ -531,11 +533,11 @@ func grepRG(pattern, root string, caseSensitive bool, projectDir string) (string
 
 // grepPython is the reference pure-Go grep scan; also the rg fallback.
 //
-// P6: files are scanned in parallel (≤4 workers) while the join stays
-// deterministic — results are collected per file in walk order, the shared
-// atomic cap stops NEW file scans once the budget is spent, and the final
-// join re-applies the cap in walk order, so the observable contract is
-// unchanged: post-cap files never appear in the result.
+// P6: files are scanned in parallel (≤4 workers) while the result stays
+// deterministic — each file's entries are collected in walk order, a single
+// huge file stops mid-scan at its own local cap, and the final join
+// truncates in walk order. The observable contract is unchanged: post-cap
+// files never appear in the result.
 func grepPython(pattern, root string, caseSensitive bool, projectDir string) string {
 	re, err := regexp.Compile(pattern)
 	if !caseSensitive {
@@ -563,28 +565,22 @@ func grepPython(pattern, root string, caseSensitive bool, projectDir string) str
 	})
 
 	results := make([][]string, len(files))
-	var total atomic.Int64
-	var capped atomic.Bool
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	for i, file := range files {
 		wg.Add(1)
 		go func(i int, file string) {
 			defer wg.Done()
-			if capped.Load() {
-				return // the budget is spent: don't start new scans
-			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if capped.Load() {
-				return
-			}
-			results[i] = scanFileForGrep(file, re, projectDir, &total, &capped)
+			results[i] = scanFileForGrep(file, re, projectDir)
 		}(i, file)
 	}
 	wg.Wait()
 
-	// Join in walk order; truncate at the cap (the authoritative cut).
+	// Join in walk order; truncate at the cap (the authoritative cut). The
+	// entry that crosses the cap IS included, then capText truncates — the
+	// exact semantics of the pre-parallel scan.
 	var matches []string
 	totalChars := 0
 	for _, entries := range results {
@@ -593,10 +589,10 @@ func grepPython(pattern, root string, caseSensitive bool, projectDir string) str
 				totalChars++ // the "\n" separator
 			}
 			totalChars += utf8.RuneCountInString(entry)
+			matches = append(matches, entry)
 			if totalChars > MaxResultChars {
 				return capText(strings.Join(matches, "\n"))
 			}
-			matches = append(matches, entry)
 		}
 	}
 	if len(matches) == 0 {
@@ -606,8 +602,9 @@ func grepPython(pattern, root string, caseSensitive bool, projectDir string) str
 }
 
 // scanFileForGrep scans one file, collecting matching lines as
-// 'relpath:lineno: text'; stops mid-file once the shared cap is spent.
-func scanFileForGrep(file string, re *regexp.Regexp, projectDir string, total *atomic.Int64, capped *atomic.Bool) []string {
+// 'relpath:lineno: text'. A single huge file stops mid-scan at its own
+// local cap (the join truncates authoritatively in walk order).
+func scanFileForGrep(file string, re *regexp.Regexp, projectDir string) []string {
 	f, err := os.Open(file)
 	if err != nil {
 		return nil
@@ -615,6 +612,7 @@ func scanFileForGrep(file string, re *regexp.Regexp, projectDir string, total *a
 	defer f.Close()
 	rel, _ := filepath.Rel(projectDir, file)
 	var entries []string
+	localChars := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	lineno := 0
@@ -626,8 +624,8 @@ func scanFileForGrep(file string, re *regexp.Regexp, projectDir string, total *a
 		}
 		entry := filepath.ToSlash(rel) + ":" + fmt.Sprint(lineno) + ": " + strings.TrimRight(line, "\r\n")
 		entries = append(entries, entry)
-		if total.Add(int64(utf8.RuneCountInString(entry)+1)) > MaxResultChars {
-			capped.Store(true)
+		localChars += utf8.RuneCountInString(entry) + 1
+		if localChars > MaxResultChars {
 			break
 		}
 	}

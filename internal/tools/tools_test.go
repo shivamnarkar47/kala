@@ -9,8 +9,11 @@ package tools_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -772,4 +775,74 @@ func asFloat(v any) float64 {
 		return f
 	}
 	return 0
+}
+
+func TestGrepRGPythonEquivalence(t *testing.T) {
+	// rg (when available) and the pure-Go fallback return the same matches
+	// (the Python test_grep_rg_python_equivalence).
+	e := setup(t)
+	e.make("alpha.txt", "needle alpha\nplain line\n")
+	e.make("beta.txt", "NEEDLE upper\n")
+	e.make("sub/gamma.txt", "nothing here\nneedle gamma\n")
+	if _, err := osexec.LookPath("rg"); err != nil {
+		t.Skip("rg not on PATH")
+	}
+	rgResult := exec(t, e.reg, "grep", map[string]any{"pattern": "needle"})
+	rgCase := exec(t, e.reg, "grep", map[string]any{"pattern": "NEEDLE", "case": true})
+	old := tools.RgLookup
+	tools.RgLookup = func(string) (string, error) { return "", errors.New("no rg") }
+	defer func() { tools.RgLookup = old }()
+	pyResult := exec(t, e.reg, "grep", map[string]any{"pattern": "needle"})
+	pyCase := exec(t, e.reg, "grep", map[string]any{"pattern": "NEEDLE", "case": true})
+
+	if sortedLines(rgResult) != sortedLines(pyResult) {
+		t.Fatalf("rg vs fallback:\\nrg: %q\\npy: %q", rgResult, pyResult)
+	}
+	if sortedLines(rgCase) != sortedLines(pyCase) {
+		t.Fatalf("case rg vs fallback:\\nrg: %q\\npy: %q", rgCase, pyCase)
+	}
+	for _, want := range []string{"alpha.txt:1: needle alpha", "sub/gamma.txt:2: needle gamma", "beta.txt:1: NEEDLE upper"} {
+		if !strings.Contains(rgResult, want) {
+			t.Fatalf("missing %q in %q", want, rgResult)
+		}
+	}
+	if strings.Contains(rgCase, "needle alpha") {
+		t.Fatalf("case-sensitive must exclude: %q", rgCase)
+	}
+}
+
+func sortedLines(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+func TestGrepCapSentinelBothEngines(t *testing.T) {
+	// The cap-sentinel guarantee holds for rg AND the pure-Go fallback.
+	e := setup(t)
+	var sb strings.Builder
+	for i := 1; i <= 3000; i++ {
+		sb.WriteString("needle " + itoa(i) + "\n")
+	}
+	e.make("many.txt", sb.String())
+	e.make("sub/sentinel.txt", "needle sentinel\n")
+	results := []string{exec(t, e.reg, "grep", map[string]any{"pattern": "needle"})}
+	old := tools.RgLookup
+	tools.RgLookup = func(string) (string, error) { return "", errors.New("no rg") }
+	defer func() { tools.RgLookup = old }()
+	results = append(results, exec(t, e.reg, "grep", map[string]any{"pattern": "needle"}))
+	for _, result := range results {
+		if len(result) > tools.MaxResultChars+len(tools.TruncatedSuffix) {
+			t.Fatalf("result too long: %d", len(result))
+		}
+		if !strings.HasSuffix(result, tools.TruncatedSuffix) {
+			t.Fatal("no truncation suffix")
+		}
+		if !strings.HasPrefix(result, "many.txt:1: needle 1") {
+			t.Fatalf("prefix: %q", result[:40])
+		}
+		if strings.Contains(result, "sentinel") {
+			t.Fatal("post-cap file appeared")
+		}
+	}
 }

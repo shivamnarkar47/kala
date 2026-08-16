@@ -12,9 +12,12 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -53,6 +56,24 @@ const (
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// AgentGeneratorSystemPrompt is the AI agent designer's system prompt
+// (verbatim from tui.py): the model answers with ONLY a JSON persona.
+const AgentGeneratorSystemPrompt = `You are an agent designer for a coding harness. The user describes an agent
+persona they want. Respond with ONLY a JSON object: {"name": "<a strong,
+fitting name — prefer Sanskrit/epic-flavored names in the spirit of the
+Pandavas>", "description": "<one or two sentences describing the persona's
+strengths and style>"}.`
+
+const agentGeneratorMaxTokens = 300
+
+var slashCommands = []string{
+	"/help", "/new", "/resume", "/sessions", "/models", "/connect",
+	"/memory", "/model", "/verbose", "/sidebar", "/structure",
+	"/diagram", "/diagrams", "/topbar", "/agents", "/quit",
+}
+
+var mermaidFenceRe = regexp.MustCompile("(?s)```mermaid\n(.*?)```")
+
 // -- messages ------------------------------------------------------------------
 
 type turnEventMsg struct{ ev loop.AgentEvent }
@@ -74,6 +95,18 @@ type openAskMsg struct {
 	options  []string
 	answerCh chan string
 }
+
+type diagramArtMsg struct {
+	text string
+	err  error
+}
+
+type agentDoneMsg struct {
+	reply  string
+	phrase string
+}
+
+type agentErrorMsg struct{ message string }
 
 // -- blocks ---------------------------------------------------------------------
 
@@ -102,16 +135,21 @@ const (
 	modalConnect
 	modalModels
 	modalAsk
+	modalAgents
+	modalAgentForm
+	modalAgentIntent
 )
 
 type modal struct {
 	kind        modalKind
 	title       string
-	items       []string // filtered list (sessions / models)
+	items       []string // filtered list (sessions / models / agents)
 	allItems    []string
 	cursor      int
 	filter      string
 	input       *textarea.Model // connect key entry + models filter
+	input2      *textarea.Model // agent form description
+	formFocus   int             // 0 = name, 1 = description
 	askQuestion string
 	askOptions  []string
 	askChan     chan string
@@ -134,6 +172,9 @@ type Model struct {
 	// event marshaling seam (program.Send in production; tests swap it)
 	sendFn func(tea.Msg)
 
+	// agent personas (seeded + persisted on activation)
+	agentsState agents.State
+
 	// session state
 	sessionID     string
 	resumeNext    bool
@@ -151,11 +192,21 @@ type Model struct {
 	input          textarea.Model
 	sidebarVisible bool
 	sidebarTab     int // 0 trace, 1 memory, 2 sessions
+	topbarVisible  bool
 	traceLines     []string
 	memoryText     string
 	sessionEntries []map[string]any
 	transcript     []string
 	modal          *modal
+
+	// slash-command suggestions popup
+	suggestionsVisible bool
+	suggestions        []string
+	suggestIndex       int
+
+	// mermaid auto-render + AI agent generator
+	diagramsEnabled bool
+	generatingAgent bool
 
 	// turn state
 	turnActive    bool
@@ -232,24 +283,26 @@ func NewWithGateway(gw loop.Gateway, projectDir, modelID string, maxSteps int, a
 	}
 
 	m := &Model{
-		gateway:        gw,
-		tools:          toolRegistry,
-		mem:            mem,
-		structure:      st,
-		projectDir:     projectDir,
-		maxSteps:       maxSteps,
-		allowDangerous: allowDangerous,
-		modelID:        modelID,
-		agent:          agent,
-		sessionID:      sessions.NewSessionID(),
-		historyIndex:   -1,
-		sendFn:         func(tea.Msg) {}, // no-op until Main wires the program
-		agentStyle:     lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("15")).Bold(true),
-		rightStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		dimStyle:       lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		errorStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("203")),
-		userLabelStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true),
-		assistantLabel: lipgloss.NewStyle().Foreground(lipgloss.Color("79")).Bold(true),
+		gateway:         gw,
+		tools:           toolRegistry,
+		mem:             mem,
+		structure:       st,
+		projectDir:      projectDir,
+		maxSteps:        maxSteps,
+		allowDangerous:  allowDangerous,
+		modelID:         modelID,
+		agent:           agent,
+		sessionID:       sessions.NewSessionID(),
+		historyIndex:    -1,
+		diagramsEnabled: true,
+		agentsState:     agentState,
+		sendFn:          func(tea.Msg) {}, // no-op until Main wires the program
+		agentStyle:      lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("15")).Bold(true),
+		rightStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		dimStyle:        lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		errorStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("203")),
+		userLabelStyle:  lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true),
+		assistantLabel:  lipgloss.NewStyle().Foreground(lipgloss.Color("79")).Bold(true),
 	}
 	m.input = textarea.New()
 	m.input.Placeholder = "Message kaal — /help for commands"
@@ -371,8 +424,141 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case openAskMsg:
 		m.openAskModal(msg)
+	case diagramArtMsg:
+		m.onDiagramArt(msg)
+	case agentDoneMsg:
+		m.onAgentGenerated(msg.reply, msg.phrase)
+	case agentErrorMsg:
+		m.onAgentGeneratorError(msg.message)
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// parseAgentJSON extracts a {name, description} agent from a generator
+// reply: json first; on failure, tolerantly grabs the first { to the last }
+// (models love surrounding prose). nil when no usable name survives.
+func parseAgentJSON(reply string) *agents.Agent {
+	text := strings.TrimSpace(reply)
+	var candidates []string
+	candidates = append(candidates, text)
+	if i := strings.Index(text, "{"); i >= 0 {
+		if j := strings.LastIndex(text, "}"); j > i {
+			candidates = append(candidates, text[i:j+1])
+		}
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		var parsed agents.Agent
+		if err := json.Unmarshal([]byte(c), &parsed); err != nil {
+			continue
+		}
+		parsed.Name = strings.TrimSpace(parsed.Name)
+		if parsed.Name != "" {
+			parsed.Description = strings.TrimSpace(parsed.Description)
+			return &parsed
+		}
+	}
+	return nil
+}
+
+// generateAgent runs one agent-generation completion on a worker goroutine
+// (Ctrl+G and the /agents -> n form share this). On success the new agent is
+// added + activated + persisted; on failure a notice is written. Re-entry
+// guard: while a generator is in flight (or a turn is active) a second start
+// is refused.
+func (m *Model) generateAgent(prompt, systemPrompt, phrase string) {
+	if m.generatingAgent || m.turnActive {
+		m.appendNotice("agent generator: already running")
+		return
+	}
+	m.generatingAgent = true
+	m.thinking = true
+	send := m.sendFn
+	go func() {
+		msgs := []any{
+			messages.WireSystem{Role: "system", Content: systemPrompt},
+			messages.WireUser{Role: "user", Content: prompt},
+		}
+		var reply strings.Builder
+		for ev := range m.gateway.Stream(context.Background(), msgs, nil, agentGeneratorMaxTokens) {
+			switch ev.Kind {
+			case gateway.EventContent:
+				reply.WriteString(ev.Text)
+			case gateway.EventError:
+				send(agentErrorMsg{message: ev.Text})
+				return
+			}
+		}
+		send(agentDoneMsg{reply: reply.String(), phrase: phrase})
+	}()
+}
+
+func (m *Model) onAgentGenerated(reply, phrase string) {
+	m.generatingAgent = false
+	m.thinking = false
+	agent := parseAgentJSON(reply)
+	if agent == nil {
+		m.appendError("agent generator: could not parse a name/description")
+		return
+	}
+	m.addAgent(*agent, "agent: "+agent.Name+" "+phrase)
+}
+
+func (m *Model) onAgentGeneratorError(message string) {
+	m.generatingAgent = false
+	m.thinking = false
+	m.appendError("agent generator: " + message)
+}
+
+// addAgent appends, activates, and persists an agent.
+func (m *Model) addAgent(agent agents.Agent, notice string) {
+	state := agents.Load(m.projectDir)
+	state.Agents = append(state.Agents, agent)
+	state.Active = agent.Name
+	_ = agents.Save(m.projectDir, state)
+	m.agentsState = state
+	m.agent = &prompts.Agent{Name: agent.Name, Description: agent.Description}
+	m.appendNotice(notice)
+}
+
+// deleteAgent removes an agent by name and persists.
+func (m *Model) deleteAgent(name string) {
+	state := agents.Load(m.projectDir)
+	kept := state.Agents[:0]
+	for _, a := range state.Agents {
+		if a.Name != name {
+			kept = append(kept, a)
+		}
+	}
+	state.Agents = kept
+	if state.Active == name {
+		state.Active = ""
+		if len(kept) > 0 {
+			state.Active = kept[0].Name
+			m.agent = &prompts.Agent{Name: kept[0].Name, Description: kept[0].Description}
+		} else {
+			m.agent = nil
+		}
+	}
+	_ = agents.Save(m.projectDir, state)
+	m.agentsState = state
+	m.appendNotice("agent deleted: " + name)
+}
+
+// activateAgent persists the active persona and updates the status bar.
+func (m *Model) activateAgent(name string) {
+	state := agents.Load(m.projectDir)
+	state.Active = name
+	_ = agents.Save(m.projectDir, state)
+	m.agentsState = state
+	for i := range state.Agents {
+		if state.Agents[i].Name == name {
+			m.agent = &prompts.Agent{Name: state.Agents[i].Name, Description: state.Agents[i].Description}
+		}
+	}
+	m.appendNotice("agent: " + name + " active")
 }
 
 // handleKey routes one keypress; returns follow-up cmds.
@@ -398,19 +584,76 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "ctrl+s":
 		m.sidebarVisible = !m.sidebarVisible
 		m.resize()
+	case "ctrl+t":
+		m.topbarVisible = !m.topbarVisible
+	case "ctrl+d":
+		m.diagramsEnabled = !m.diagramsEnabled
+		if m.diagramsEnabled {
+			m.appendNotice("diagrams on")
+		} else {
+			m.appendNotice("diagrams off")
+		}
+	case "ctrl+g":
+		if m.generatingAgent {
+			m.appendNotice("agent generator: already running")
+			return nil
+		}
+		if m.turnActive {
+			m.appendNotice("(busy — wait for the current turn)")
+			return nil
+		}
+		if m.modal != nil {
+			return nil // a modal is already up; don't stack another
+		}
+		m.openAgentIntentModal()
+	case "tab", "shift+tab":
+		if m.suggestionsVisible && len(m.suggestions) > 0 {
+			if msg.String() == "shift+tab" {
+				m.suggestIndex = (m.suggestIndex - 1 + len(m.suggestions)) % len(m.suggestions)
+			} else {
+				m.suggestIndex = (m.suggestIndex + 1) % len(m.suggestions)
+			}
+			m.input.SetValue(m.suggestions[m.suggestIndex])
+			m.input.CursorEnd()
+			return nil
+		}
+		m.input.InsertString("\t")
+		return nil
 	case "enter":
 		if !isShift(msg) {
 			return m.Submit(m.input.Value())
 		}
 		m.input.InsertString("\n")
-	case "tab", "shift+tab":
-		// slash-command completion is a P6 polish item; tab passes through.
-		return nil
 	}
 	// Everything else goes to the composer textarea.
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.updateSuggestions()
 	return cmd
+}
+
+// updateSuggestions shows the slash-command popup when the input starts
+// with "/".
+func (m *Model) updateSuggestions() {
+	value := m.input.Value()
+	if strings.HasPrefix(value, "/") {
+		filter := strings.ToLower(value[1:])
+		var matches []string
+		for _, c := range slashCommands {
+			if strings.Contains(c, "/"+filter) {
+				matches = append(matches, c)
+			}
+		}
+		m.suggestions = matches
+		m.suggestionsVisible = len(matches) > 0
+		if m.suggestIndex >= len(m.suggestions) {
+			m.suggestIndex = 0
+		}
+	} else {
+		m.suggestionsVisible = false
+		m.suggestions = nil
+		m.suggestIndex = 0
+	}
 }
 
 // -- slash commands ---------------------------------------------------------------
@@ -461,6 +704,26 @@ func (m *Model) runCommand(text string) {
 			ids = append(ids, model.ID)
 		}
 		m.openListModal(modalModels, "Models", ids)
+	case "/agents":
+		state := agents.Load(m.projectDir)
+		m.agentsState = state
+		names := agents.AgentNames(state)
+		m.openListModal(modalAgents, "Agents", names)
+	case "/diagram":
+		if arg == "" {
+			m.appendNotice("usage: /diagram <file.mmd>")
+			return
+		}
+		m.renderMermaidFile(arg)
+	case "/diagrams":
+		m.diagramsEnabled = !m.diagramsEnabled
+		if m.diagramsEnabled {
+			m.appendNotice("diagrams on")
+		} else {
+			m.appendNotice("diagrams off")
+		}
+	case "/topbar":
+		m.topbarVisible = !m.topbarVisible
 	case "/connect":
 		if arg != "" {
 			_ = config.SaveUserAPIKey(arg) // inline key, no popup
@@ -575,6 +838,7 @@ func (m *Model) onTurnDone(err error) {
 	}
 	m.input.Focus()
 	m.viewport.GotoBottom()
+	m.renderMermaidDiagrams()
 }
 
 // -- rendering helpers ----------------------------------------------------------------
@@ -729,6 +993,82 @@ func (m *Model) appendError(text string) {
 	m.renderConversation()
 }
 
+// -- mermaid rendering ----------------------------------------------------------------
+
+// renderMermaidDiagrams auto-renders ```mermaid fences at turn end: each
+// fence goes to a worker goroutine (termaid) and the art lands below the
+// answer. Skipped when diagrams are toggled off or termaid is missing (a
+// notice replaces the art).
+func (m *Model) renderMermaidDiagrams() {
+	if !m.diagramsEnabled {
+		return
+	}
+	var text strings.Builder
+	for _, b := range m.blocks {
+		if b.kind == blockAssistant {
+			text.WriteString(b.text)
+		}
+	}
+	fences := mermaidFenceRe.FindAllStringSubmatch(text.String(), -1)
+	if len(fences) == 0 {
+		return
+	}
+	send := m.sendFn
+	for _, f := range fences {
+		body := f[1]
+		go func(body string) {
+			art, err := renderMermaid(body)
+			send(diagramArtMsg{text: art, err: err})
+		}(body)
+	}
+}
+
+// renderMermaidFile renders one .mmd file via termaid (/diagram).
+func (m *Model) renderMermaidFile(path string) {
+	send := m.sendFn
+	go func() {
+		out, err := exec.Command("termaid", path).CombinedOutput()
+		send(diagramArtMsg{text: string(out), err: err})
+	}()
+}
+
+// renderMermaid runs termaid on a fence body (written to a temp .mmd).
+func renderMermaid(body string) (string, error) {
+	if _, err := exec.LookPath("termaid"); err != nil {
+		return "", errors.New("termaid not found — install it with: uv tool install termaid")
+	}
+	tmp, err := os.CreateTemp("", "kaal-diagram-*.mmd")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.WriteString(body); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+	out, err := exec.Command("termaid", name).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("termaid: %s", strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func (m *Model) onDiagramArt(msg diagramArtMsg) {
+	if msg.err != nil {
+		m.appendNotice("diagram: " + msg.err.Error())
+		return
+	}
+	text := strings.TrimRight(msg.text, "\n")
+	if text == "" {
+		m.appendNotice("diagram: (empty)")
+		return
+	}
+	m.blocks = append(m.blocks, block{kind: blockNotice, text: text})
+	m.renderConversation()
+}
+
 // -- history -------------------------------------------------------------------------
 
 func (m *Model) historyPrev() {
@@ -860,6 +1200,28 @@ func (m *Model) openConnectModal() {
 	m.modal = &modal{kind: modalConnect, title: "Connect", input: &in}
 }
 
+func (m *Model) openAgentIntentModal() {
+	in := textarea.New()
+	in.Placeholder = "describe the agent you want…"
+	in.ShowLineNumbers = false
+	in.SetWidth(60)
+	in.Focus()
+	m.modal = &modal{kind: modalAgentIntent, title: "New agent (AI)", input: &in}
+}
+
+func (m *Model) openAgentFormModal() {
+	name := textarea.New()
+	name.Placeholder = "agent name"
+	name.ShowLineNumbers = false
+	name.SetWidth(40)
+	name.Focus()
+	desc := textarea.New()
+	desc.Placeholder = "one or two sentences about the persona"
+	desc.ShowLineNumbers = false
+	desc.SetWidth(60)
+	m.modal = &modal{kind: modalAgentForm, title: "New agent", input: &name, input2: &desc, formFocus: 0}
+}
+
 func (m *Model) openAskModal(msg openAskMsg) {
 	in := textarea.New()
 	in.Placeholder = "answer…"
@@ -905,6 +1267,93 @@ func (m *Model) handleModalKey(msg tea.KeyMsg) tea.Cmd {
 				}
 				return cmd
 			}
+		}
+	case modalAgents:
+		switch msg.String() {
+		case "up", "k":
+			if mod.cursor > 0 {
+				mod.cursor--
+			}
+		case "down", "j":
+			if mod.cursor < len(mod.items)-1 {
+				mod.cursor++
+			}
+		case "enter":
+			if mod.cursor < len(mod.items) {
+				m.closeModal(mod.items[mod.cursor])
+			}
+		case "n":
+			m.openAgentFormModal()
+		case "d":
+			if mod.cursor < len(mod.items) {
+				name := mod.items[mod.cursor]
+				m.deleteAgent(name)
+				mod.items = agents.AgentNames(m.agentsState)
+				if mod.cursor >= len(mod.items) {
+					mod.cursor = len(mod.items) - 1
+				}
+			}
+		case "esc":
+			m.closeModal(nil)
+		}
+	case modalAgentForm:
+		if mod.input == nil || mod.input2 == nil {
+			return nil
+		}
+		switch msg.String() {
+		case "tab", "shift+tab":
+			mod.formFocus = 1 - mod.formFocus
+			if mod.formFocus == 0 {
+				mod.input.Focus()
+				mod.input2.Blur()
+			} else {
+				mod.input2.Focus()
+				mod.input.Blur()
+			}
+		case "enter":
+			if !isShift(msg) {
+				name := strings.TrimSpace(mod.input.Value())
+				desc := strings.TrimSpace(mod.input2.Value())
+				if name == "" {
+					m.appendNotice("agent form: name required")
+					return nil
+				}
+				m.closeModal(agents.Agent{Name: name, Description: desc})
+			} else {
+				if mod.formFocus == 0 {
+					mod.input.InsertString("\n")
+				} else {
+					mod.input2.InsertString("\n")
+				}
+			}
+		case "esc":
+			m.closeModal(nil)
+		default:
+			var cmd tea.Cmd
+			if mod.formFocus == 0 {
+				*mod.input, cmd = mod.input.Update(msg)
+			} else {
+				*mod.input2, cmd = mod.input2.Update(msg)
+			}
+			return cmd
+		}
+	case modalAgentIntent:
+		if mod.input == nil {
+			return nil
+		}
+		switch msg.String() {
+		case "enter":
+			if !isShift(msg) {
+				m.closeModal(mod.input.Value())
+			} else {
+				mod.input.InsertString("\n")
+			}
+		case "esc":
+			m.closeModal(nil)
+		default:
+			var cmd tea.Cmd
+			*mod.input, cmd = mod.input.Update(msg)
+			return cmd
 		}
 	case modalConnect, modalAsk:
 		if mod.input == nil {
@@ -983,6 +1432,18 @@ func (m *Model) closeModal(value any) {
 			_ = config.SaveUserAPIKey(strings.TrimSpace(key))
 			m.appendNotice("api key saved")
 		}
+	case modalAgents:
+		if name, ok := value.(string); ok {
+			m.activateAgent(name)
+		}
+	case modalAgentForm:
+		if agent, ok := value.(agents.Agent); ok {
+			m.addAgent(agent, "agent: "+agent.Name+" added and active")
+		}
+	case modalAgentIntent:
+		if intent, ok := value.(string); ok && strings.TrimSpace(intent) != "" {
+			m.generateAgent(strings.TrimSpace(intent), AgentGeneratorSystemPrompt, "generated and active")
+		}
 	}
 	m.input.Focus()
 }
@@ -1011,6 +1472,23 @@ func (m *Model) View() string {
 	if m.width == 0 {
 		return "kaal — resize the terminal to begin\n"
 	}
+	topbar := ""
+	if m.topbarVisible {
+		model := m.modelID
+		session := m.sessionID
+		if len(session) > 15 {
+			session = session[:15]
+		}
+		brand := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("KAAL")
+		identity := m.dimStyle.Render("  " + model + " · " + session + "  ")
+		actions := m.dimStyle.Render("[New chat] [Sessions] [Agents]")
+		topbar = lipgloss.NewStyle().Width(m.width).BorderBottom(true).Render(
+			brand+identity+actions,
+		) + "\n"
+	}
+	if m.modal != nil {
+		return topbar + m.modalView()
+	}
 	sidebar := ""
 	if m.sidebarVisible {
 		header := lipgloss.NewStyle().Bold(true).Render("Workspace")
@@ -1035,11 +1513,119 @@ func (m *Model) View() string {
 		lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Render(state) + "\n" +
 		m.input.View()
 
+	suggestions := ""
+	if m.suggestionsVisible && len(m.suggestions) > 0 {
+		var sb strings.Builder
+		for i, cmd := range m.suggestions {
+			if i == m.suggestIndex {
+				sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("  " + cmd))
+			} else {
+				sb.WriteString(m.dimStyle.Render("  " + cmd))
+			}
+			sb.WriteString("\n")
+		}
+		suggestions = lipgloss.NewStyle().Width(m.width).BorderTop(true).Render(
+			strings.TrimRight(sb.String(), "\n"),
+		) + "\n"
+	}
+
 	status := m.statusBar()
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, m.viewport.View(), sidebar) + "\n" +
+	return topbar +
+		lipgloss.JoinHorizontal(lipgloss.Top, m.viewport.View(), sidebar) + "\n" +
+		suggestions +
 		composer + "\n" +
 		status
+}
+
+// modalView renders the active modal (sessions/models/agents lists, connect
+// key entry, agent form, ask question) instead of the composer.
+func (m *Model) modalView() string {
+	mod := m.modal
+	if mod == nil {
+		return ""
+	}
+	title := lipgloss.NewStyle().Bold(true).Render(mod.title)
+	var body strings.Builder
+	switch mod.kind {
+	case modalSessions, modalAgents:
+		if len(mod.items) == 0 {
+			body.WriteString(m.dimStyle.Render("(empty)"))
+			break
+		}
+		for i, item := range mod.items {
+			if i == mod.cursor {
+				body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("▸ " + item))
+			} else {
+				body.WriteString("  " + item)
+			}
+			body.WriteString("\n")
+		}
+		if mod.kind == modalAgents {
+			body.WriteString(m.dimStyle.Render("enter activate · n new · d delete · esc close"))
+		}
+	case modalModels:
+		if mod.input != nil {
+			body.WriteString(m.dimStyle.Render("filter: ") + mod.input.View() + "\n\n")
+		}
+		for i, id := range mod.items {
+			price := modelPriceLine(id)
+			line := id
+			if price != "" {
+				line += m.dimStyle.Render("  " + price)
+			}
+			if i == mod.cursor {
+				body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("▸ " + line))
+			} else {
+				body.WriteString("  " + line)
+			}
+			body.WriteString("\n")
+		}
+		body.WriteString(m.dimStyle.Render("enter select · esc close"))
+	case modalConnect:
+		if mod.input != nil {
+			body.WriteString(m.dimStyle.Render("paste the API key (never displayed):") + "\n")
+			body.WriteString(mod.input.View() + "\n")
+			body.WriteString(m.dimStyle.Render("enter save · esc cancel"))
+		}
+	case modalAgentForm:
+		if mod.input != nil && mod.input2 != nil {
+			body.WriteString(m.dimStyle.Render("name:") + "\n")
+			body.WriteString(mod.input.View() + "\n")
+			body.WriteString(m.dimStyle.Render("description:") + "\n")
+			body.WriteString(mod.input2.View() + "\n")
+			body.WriteString(m.dimStyle.Render("tab switch · enter save · esc cancel"))
+		}
+	case modalAgentIntent:
+		if mod.input != nil {
+			body.WriteString(m.dimStyle.Render("describe the agent you want — the model invents it:") + "\n")
+			body.WriteString(mod.input.View() + "\n")
+			body.WriteString(m.dimStyle.Render("enter generate · esc cancel"))
+		}
+	case modalAsk:
+		if mod.input != nil {
+			body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("222")).Render(mod.title) + "\n")
+			for i, opt := range mod.askOptions {
+				body.WriteString(m.dimStyle.Render(fmt.Sprintf("  %d. %s", i+1, opt)) + "\n")
+			}
+			body.WriteString(mod.input.View() + "\n")
+			body.WriteString(m.dimStyle.Render("enter answer · esc cancel"))
+		}
+	}
+	box := lipgloss.NewStyle().Width(m.width-4).Border(lipgloss.RoundedBorder()).Padding(0, 1).Render(
+		title + "\n\n" + strings.TrimRight(body.String(), "\n"),
+	)
+	return box + "\n"
+}
+
+// modelPriceLine renders '($in/$out per M)' for a catalog model.
+func modelPriceLine(id string) string {
+	for _, model := range config.Models {
+		if model.ID == id {
+			return fmt.Sprintf("($%.2f/$%.2f per M)", model.InputPerM, model.OutputPerM)
+		}
+	}
+	return ""
 }
 
 func isShift(msg tea.KeyMsg) bool {
