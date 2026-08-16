@@ -384,9 +384,10 @@ func readLines(file string, offset int, hasOffset bool, limit int, hasLimit bool
 }
 
 // directoryListing renders a depth-limited listing: immediate children, then
-// one more level.
+// one more level. Dirs and files are sorted separately, dirs first — exactly
+// the Python _directory_listing order (parity for the gate).
 func directoryListing(root string) string {
-	var lines []string
+	var dirs, files []string
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -399,18 +400,18 @@ func directoryListing(root string) string {
 		depth := len(parts)
 		if depth == 1 {
 			if d.IsDir() {
-				lines = append(lines, d.Name()+"/")
+				dirs = append(dirs, d.Name()+"/")
 			} else {
-				lines = append(lines, d.Name())
+				files = append(files, d.Name())
 			}
 			return nil
 		}
 		if depth == 2 {
 			parent := parts[0]
 			if d.IsDir() {
-				lines = append(lines, parent+"/"+d.Name()+"/")
+				dirs = append(dirs, parent+"/"+d.Name()+"/")
 			} else {
-				lines = append(lines, parent+"/"+d.Name())
+				files = append(files, parent+"/"+d.Name())
 			}
 			if d.IsDir() {
 				return filepath.SkipDir // never descend past level 2
@@ -419,8 +420,9 @@ func directoryListing(root string) string {
 		}
 		return filepath.SkipDir
 	})
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
+	sort.Strings(dirs)
+	sort.Strings(files)
+	return strings.Join(append(dirs, files...), "\n")
 }
 
 func (r *Registry) toolGrep(ctx context.Context, args map[string]any) string {

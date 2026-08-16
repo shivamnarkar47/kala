@@ -326,14 +326,16 @@ func (l *AgentLoop) appendSessionEvents(events ...map[string]any) {
 	_ = sessions.AppendEvents(l.sessionID, events)
 }
 
-// stepLoop drives one full turn per step until an answer is produced.
+// stepLoop drives one full turn per step until an answer is produced. An
+// empty content answer IS an answer (Python returns "" — not None — as the
+// final answer); only a tool-executing turn continues.
 func (l *AgentLoop) stepLoop(emit func(AgentEvent)) (string, error) {
 	for range l.maxSteps {
-		answer, err := l.oneStep(emit)
+		answer, done, err := l.oneStep(emit)
 		if err != nil {
 			return "", err
 		}
-		if answer != "" {
+		if done {
 			return answer, nil
 		}
 	}
@@ -341,10 +343,11 @@ func (l *AgentLoop) stepLoop(emit func(AgentEvent)) (string, error) {
 }
 
 // oneStep runs one full turn: stream, heal, resolve, persist, execute.
-// Returns the final answer string, or "" when tool calls were executed (the
-// loop should continue with another step). An overflow retry re-runs the
+// Returns (answer, done, err): done=true when the turn produced a final
+// answer (possibly empty); done=false when tool calls were executed and the
+// loop should continue with another step. An overflow retry re-runs the
 // turn inside this step and must not count as a new step.
-func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
+func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, bool, error) {
 	l.Steps++
 	if emit != nil {
 		emit(AgentEvent{Kind: EventStep, Step: l.Steps})
@@ -385,7 +388,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 			case gateway.EventToolCall:
 				structuredCalls = append(structuredCalls, ev.ToolCall)
 			case gateway.EventError:
-				return "", gatewayErr("gateway error: %s", ev.Text)
+				return "", false, gatewayErr("gateway error: %s", ev.Text)
 			case gateway.EventDone:
 				if ev.FinishReason != nil {
 					finishReason = *ev.FinishReason
@@ -399,7 +402,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 			l.route(e, &contentParts, &reasoningParts, &healedCalls, emit)
 		}
 		if l.ctx.Err() != nil {
-			return "", ErrCancelled
+			return "", false, ErrCancelled
 		}
 
 		if len(structuredCalls) > 0 {
@@ -409,7 +412,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 		}
 		if finishReason == "length" && len(contentParts) == 0 && len(calls) == 0 {
 			if retried {
-				return "", loopErr("context overflow: model hit max output with empty turn")
+				return "", false, loopErr("context overflow: model hit max output with empty turn")
 			}
 			retried = true
 			l.messages = ctxutil.TruncateHistory(l.messages, *l.system, PromptBudget/2)
@@ -440,7 +443,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 
 	if len(calls) == 0 {
 		l.appendSessionEvents(sessionEvents...)
-		return content, nil
+		return content, true, nil
 	}
 
 	sig := ""
@@ -453,14 +456,14 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 	if l.ctx.Err() != nil {
 		// Cancelled: the partial turn's events are NOT persisted (Python's
 		// TurnCancelled discards the batch).
-		return "", ErrCancelled
+		return "", false, ErrCancelled
 	}
 	if err != nil {
 		// Aborted (tool loop / 5 failures): the partial batch is discarded.
-		return "", err
+		return "", false, err
 	}
 	l.appendSessionEvents(sessionEvents...)
-	return "", nil
+	return "", false, nil
 }
 
 func reasonOrNil(reasoning string) any {
@@ -928,7 +931,11 @@ func (l *AgentLoop) spawnMany(tasks []map[string]any, timeout int) string {
 			}
 			raw := l.spawn(taskText, dir, maxSteps, taskTimeout)
 			var summary map[string]any
-			if err := json.Unmarshal([]byte(raw), &summary); err != nil {
+			// UseNumber keeps ints ints — a float round-trip would emit
+			// "steps": 1.0 where Python emits "steps": 1.
+			dec := json.NewDecoder(strings.NewReader(raw))
+			dec.UseNumber()
+			if err := dec.Decode(&summary); err != nil {
 				// _spawn returned an error string (blocked dir, timeout,
 				// recursion) rather than a summary JSON.
 				records[index] = map[string]any{"index": index, "error": raw}

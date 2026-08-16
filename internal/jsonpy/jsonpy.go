@@ -22,6 +22,25 @@ import (
 	"unicode/utf8"
 )
 
+// OrderedMap is a JSON object that preserves key insertion order (Python
+// dict parity — DSML parameter marshaling emits parameters in the order the
+// model wrote them, not sorted).
+type OrderedMap struct {
+	keys []string
+	vals map[string]any
+}
+
+// NewOrderedMap builds an empty ordered object.
+func NewOrderedMap() *OrderedMap { return &OrderedMap{vals: map[string]any{}} }
+
+// Set inserts or replaces a key, keeping first-insertion order.
+func (m *OrderedMap) Set(k string, v any) {
+	if _, ok := m.vals[k]; !ok {
+		m.keys = append(m.keys, k)
+	}
+	m.vals[k] = v
+}
+
 // Marshal returns the Python-style JSON encoding of v.
 func Marshal(v any) ([]byte, error) {
 	var b strings.Builder
@@ -73,6 +92,8 @@ func writeValue(b *strings.Builder, v any) error {
 		return writeList(b, x)
 	case map[string]any:
 		return writeMap(b, x)
+	case *OrderedMap:
+		return writeOrderedMap(b, x)
 	default:
 		return writeReflect(b, reflect.ValueOf(v))
 	}
@@ -90,6 +111,22 @@ func writeList(b *strings.Builder, items []any) error {
 		}
 	}
 	b.WriteByte(']')
+	return nil
+}
+
+func writeOrderedMap(b *strings.Builder, m *OrderedMap) error {
+	b.WriteByte('{')
+	for i, k := range m.keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		writeString(b, k)
+		b.WriteString(": ")
+		if err := writeValue(b, m.vals[k]); err != nil {
+			return err
+		}
+	}
+	b.WriteByte('}')
 	return nil
 }
 

@@ -177,7 +177,7 @@ type DialectFeed struct {
 	textEmitted    bool // any visible text emitted in this feed's lifetime
 	sectionInvokes int  // complete invokes parsed in the current section
 	invokeName     string
-	args           map[string]any
+	args           *jsonpy.OrderedMap
 	paramName      string
 	paramIsString  bool
 	paramValue     []string
@@ -401,7 +401,7 @@ func (f *DialectFeed) stepSection() ([]Event, bool) {
 		tag := f.buffer[:end+1]
 		f.buffer = f.buffer[end+1:]
 		f.invokeName = attrValue(tag, "name")
-		f.args = map[string]any{}
+		f.args = jsonpy.NewOrderedMap()
 		f.state = stInvoke
 		return events, true
 	}
@@ -496,7 +496,7 @@ func (f *DialectFeed) stepParam() ([]Event, bool) {
 	if utf8.RuneCountInString(raw) > maxParameterChars {
 		raw = truncateToRunes(raw, maxParameterChars) + truncatedSuffix
 	}
-	f.args[f.paramName] = coerceValue(raw, f.paramIsString)
+	f.args.Set(f.paramName, coerceValue(raw, f.paramIsString))
 	f.state = stInvoke
 	return events, true
 }
