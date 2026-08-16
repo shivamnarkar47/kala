@@ -1,10 +1,4 @@
-__pycache__/
-*.pyc
-.venv/
-*.egg-info/
-dist/
-build/
-.omp/
-.kaal/
 /kaal
 /kaal.exe
+.kaal/
+.omp/
