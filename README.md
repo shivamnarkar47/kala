@@ -92,4 +92,5 @@ ported from the Python camp and by a byte-identical turn-2 golden fixture.
 
 This is the Go heir of a Python harness (7.8k lines, 17 modules) ported
 formation by formation and burned at a 22-case parity gate — the campaign
-record lives in `docs/go-migration-plan.md`.
+record lives in `docs/go-migration-plan.md`. What is planned next lives in
+`docs/roadmap-v0.4.md`.
