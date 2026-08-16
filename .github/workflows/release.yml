@@ -44,7 +44,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24.x" # the P0 floor; see docs/go-migration-plan.md §9.1
+      # shell: bash — ${GITHUB_REF_NAME#v} is bash parameter expansion; the
+      # default Windows shell (PowerShell) would expand it to an undefined
+      # variable and stamp an EMPTY version into the binary.
       - name: Build static binary
+        shell: bash
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
