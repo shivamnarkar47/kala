@@ -87,6 +87,15 @@ func newFakeGateway(scripts ...[]gateway.StreamEvent) *fakeGateway {
 
 func (f *fakeGateway) Stream(ctx context.Context, msgs []any, toolsList []any, maxTokens int) <-chan gateway.StreamEvent {
 	f.mu.Lock()
+	if len(f.scripts) == 0 {
+		// Script exhausted (a test that under-supplied turns): emit a clean
+		// done instead of panicking the whole test binary.
+		ch := make(chan gateway.StreamEvent, 1)
+		ch <- gateway.StreamEvent{Kind: gateway.EventDone}
+		close(ch)
+		f.mu.Unlock()
+		return ch
+	}
 	script := f.scripts[0]
 	f.scripts = f.scripts[1:]
 	f.calls = append(f.calls, streamCall{msgs: msgs, tools: toolsList})
@@ -1664,15 +1673,12 @@ func TestCancelDuringAskAbortsWithoutPersisting(t *testing.T) {
 	env := setup(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	called := make(chan struct{})
+	unblock := make(chan struct{})
 	l := agentLoop(t, gw, env.realTools(), env.mem, env.sessionID,
 		loop.WithContext(ctx),
 		loop.WithAskHandler(func(question string, options []string) string {
-			select {
-			case <-called:
-			default:
-				close(called)
-			}
-			<-called // block until the test's second close
+			close(called)
+			<-unblock // block until the test releases us, so cancel lands mid-ask
 			return "yes"
 		}))
 	result := make(chan error, 1)
@@ -1694,6 +1700,9 @@ func TestCancelDuringAskAbortsWithoutPersisting(t *testing.T) {
 		t.Fatal("ask handler never called")
 	}
 	cancel()
+	// Release the handler goroutine; the wrapped select has already answered
+	// "(cancelled)" on the cancelled ctx, so the loop aborts deterministically.
+	close(unblock)
 	select {
 	case err := <-result:
 		if !errors.Is(err, loop.ErrCancelled) {
