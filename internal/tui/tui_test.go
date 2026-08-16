@@ -140,6 +140,75 @@ func TestNewStartsWithoutAPIKey(t *testing.T) {
 	}
 }
 
+func TestConnectViaEnterOpensDialogAndSaves(t *testing.T) {
+	// Regression: pressing Enter on a slash command must run the command, not
+	// submit it as a prompt. Typing /connect keyless must open the dialog
+	// (NOT the "no API key" send error), and entering a key in the dialog
+	// must persist it and clear the missing-key state.
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir+"/config")
+	t.Setenv("HOME", dir)
+	t.Setenv("OPENCODE_API_KEY", "")
+	env := setupTUI(t)
+	env.m.keyMissing = true // simulate a keyless start
+
+	env.submit(t, "/connect")
+	if env.m.modal == nil || env.m.modal.kind != modalConnect {
+		t.Fatalf("enter on /connect must open the dialog, modal=%+v", env.m.modal)
+	}
+	view := plain(env.view())
+	if strings.Contains(view, "no API key") {
+		t.Fatalf("no API key error must not show for /connect: %q", view)
+	}
+	if env.m.turnActive {
+		t.Fatal("a slash command must not start a turn")
+	}
+
+	// Paste a key into the dialog and press enter: saved + made live.
+	env.m.modal.input.SetValue("sk-dialog-key")
+	env.m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if env.m.modal != nil {
+		t.Fatal("dialog must close on enter")
+	}
+	if got := config.LoadUserAPIKey(); got != "sk-dialog-key" {
+		t.Fatalf("saved key: %q", got)
+	}
+	if env.m.keyMissing {
+		t.Fatal("keyMissing must clear after the dialog saves")
+	}
+}
+
+func TestEnterOnSlashCommandDoesNotSubmit(t *testing.T) {
+	// A leading / must route to the command parser even when a key exists,
+	// instead of being sent to the model as a prompt.
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir+"/config")
+	t.Setenv("HOME", dir)
+	if err := config.SaveUserAPIKey("sk-present"); err != nil {
+		t.Fatal(err)
+	}
+	env := setupTUI(t)
+	env.m.applySavedKey()
+	if env.m.keyMissing {
+		t.Fatal("keyMissing should be false with a stored key")
+	}
+
+	env.submit(t, "/model")
+	if env.m.turnActive {
+		t.Fatal("/model must not start a turn")
+	}
+	if env.gw.calls != 0 {
+		t.Fatalf("gateway must not be called: %d calls", env.gw.calls)
+	}
+	last := env.m.blocks[len(env.m.blocks)-1]
+	if !strings.Contains(last.text, "deepseek-v4-flash") {
+		t.Fatalf("/model notice missing from blocks: %q", last.text)
+	}
+	if got := env.m.input.Value(); got != "" {
+		t.Fatalf("composer must clear after a command, got %q", got)
+	}
+}
+
 func setupTUI(t *testing.T, scripts ...[]gateway.StreamEvent) *testEnv {
 	t.Helper()
 	dir := t.TempDir()

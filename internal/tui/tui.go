@@ -301,15 +301,17 @@ func New(projectDir string, maxSteps int, allowDangerous bool) (*Model, error) {
 }
 
 // applySavedKey pushes a key saved via /connect into the live gateway and
-// clears the missing-key state so the next turn can run. No-op when the
-// gateway is not the real one (tests inject fakes).
+// clears the missing-key state so the next turn can run. No-op when no key
+// is stored yet (the save failed or nothing was entered).
 func (m *Model) applySavedKey() {
-	if g, ok := m.gateway.(*gateway.Gateway); ok {
-		if key := config.LoadUserAPIKey(); key != "" {
-			g.APIKey = key
-			m.keyMissing = false
-		}
+	key := config.LoadUserAPIKey()
+	if key == "" {
+		return
 	}
+	if g, ok := m.gateway.(*gateway.Gateway); ok {
+		g.APIKey = key
+	}
+	m.keyMissing = false
 }
 
 // NewWithGateway builds the workbench around an injected gateway (tests
@@ -686,7 +688,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	case "enter":
 		if !isShift(msg) {
-			return m.Submit(m.input.Value())
+			value := m.input.Value()
+			if strings.HasPrefix(strings.TrimSpace(value), "/") {
+				m.input.Reset()
+				m.updateSuggestions()
+				m.runCommand(value)
+				return nil
+			}
+			return m.Submit(value)
 		}
 		m.input.InsertString("\n")
 	}
@@ -791,9 +800,12 @@ func (m *Model) runCommand(text string) {
 		m.topbarVisible = !m.topbarVisible
 	case "/connect":
 		if arg != "" {
-			_ = config.SaveUserAPIKey(arg) // inline key, no popup
-			m.applySavedKey()
-			m.appendNotice("api key saved")
+			if err := config.SaveUserAPIKey(arg); err != nil {
+				m.appendError("could not save API key: " + err.Error())
+			} else {
+				m.applySavedKey() // inline key, no popup
+				m.appendNotice("api key saved")
+			}
 		} else {
 			m.openConnectModal()
 		}
@@ -1537,9 +1549,12 @@ func (m *Model) closeModal(value any) {
 		}
 	case modalConnect:
 		if key, ok := value.(string); ok && strings.TrimSpace(key) != "" {
-			_ = config.SaveUserAPIKey(strings.TrimSpace(key))
-			m.applySavedKey()
-			m.appendNotice("api key saved")
+			if err := config.SaveUserAPIKey(strings.TrimSpace(key)); err != nil {
+				m.appendError("could not save API key: " + err.Error())
+			} else {
+				m.applySavedKey()
+				m.appendNotice("api key saved")
+			}
 		}
 	case modalAgents:
 		if name, ok := value.(string); ok {
