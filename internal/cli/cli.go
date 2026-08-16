@@ -40,6 +40,7 @@ import (
 	"github.com/kaal/kaal/internal/sessions"
 	"github.com/kaal/kaal/internal/toolcache"
 	"github.com/kaal/kaal/internal/tools"
+	"github.com/kaal/kaal/internal/tui"
 )
 
 const version = "0.3"
@@ -85,10 +86,14 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newDoctorCmd(stdout, stderr))
 	root.AddCommand(newUpdateCmd(stdout, stderr))
 	root.AddCommand(newDiagramsCmd(stdout, stderr))
-	// No subcommand: the Python build launches the Textual TUI. The Go TUI
-	// lands in P5 — until then, point the user at the road that exists.
+	// No subcommand: launch the bubbletea workbench (Python launches the
+	// Textual TUI). The TUI needs a real terminal; without one, point the
+	// user at the one-shot road.
 	root.RunE = func(cmd *cobra.Command, args []string) error {
-		fmt.Fprintln(stderr, "kaal: the Go TUI lands in P5 — use `kaal run \"PROMPT\"` for now")
+		if f, ok := stdout.(*os.File); ok && isTerminal(f) {
+			return &exitError{code: tui.Main()}
+		}
+		fmt.Fprintln(stderr, "kaal: the TUI needs a terminal — use `kaal run \"PROMPT\"` for one-shot runs")
 		return &exitError{code: 1}
 	}
 	return root

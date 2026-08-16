@@ -515,12 +515,14 @@ func TestStructureEntryCount(t *testing.T) {
 	}
 }
 
-func TestNoSubcommandPlaceholder(t *testing.T) {
+func TestNoSubcommandNeedsTerminal(t *testing.T) {
+	// A non-TTY stdout (the test buffer) must not launch the TUI: it gets
+	// the one-shot hint and exit 1.
 	code, _, errOut := runMain(t, "", "")
 	if code != 1 {
 		t.Fatalf("code %d", code)
 	}
-	if !strings.Contains(errOut, "P5") {
+	if !strings.Contains(errOut, "TUI needs a terminal") {
 		t.Fatalf("err: %q", errOut)
 	}
 }

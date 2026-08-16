@@ -120,6 +120,10 @@ type Registry interface {
 	ProjectDir() string
 }
 
+// ErrCancelled aborts a turn's context (the TUI's Ctrl+C hard cancel): the
+// turn ends quietly — no error event, no session summary, no retry.
+var ErrCancelled = errors.New("turn cancelled")
+
 // Option configures an AgentLoop.
 type Option func(*AgentLoop)
 
@@ -146,6 +150,18 @@ func WithAskHandler(h func(question string, options []string) string) Option {
 	return func(l *AgentLoop) { l.askHandler = h }
 }
 
+// WithStructure injects the structure manager (the TUI passes its own so
+// the cache survives across turns).
+func WithStructure(st *structure.StructureManager) Option {
+	return func(l *AgentLoop) { l.structure = st }
+}
+
+// WithContext sets the turn context (the TUI's hard-cancel seam: cancelling
+// it aborts the in-flight SSE stream and ends the turn with ErrCancelled).
+func WithContext(ctx context.Context) Option {
+	return func(l *AgentLoop) { l.ctx = ctx }
+}
+
 // AgentLoop is one runnable task loop over a streaming gateway and a tool
 // registry.
 type AgentLoop struct {
@@ -161,6 +177,7 @@ type AgentLoop struct {
 	spawnDepth     int
 	agent          *prompts.Agent
 	askHandler     func(question string, options []string) string
+	ctx            context.Context
 
 	verifyCmd []string // from .kaal/hooks.json, read once at Run() start
 
@@ -182,7 +199,7 @@ type AgentLoop struct {
 func NewAgentLoop(gw Gateway, reg Registry, mem *memory.Memory, sessionID string, opts ...Option) *AgentLoop {
 	l := &AgentLoop{
 		gateway: gw, tools: reg, memory: mem, sessionID: sessionID,
-		maxSteps: 20, spawnDepth: 1, enableVerify: true,
+		maxSteps: 20, spawnDepth: 1, enableVerify: true, ctx: context.Background(),
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -253,6 +270,9 @@ func (l *AgentLoop) Run(task string, emit func(AgentEvent)) (string, error) {
 
 	answer, err := l.stepLoop(emit)
 	if err != nil {
+		if errors.Is(err, ErrCancelled) {
+			return "", err // quiet end: the TUI's Ctrl+C, not a failure
+		}
 		var le *LoopError
 		if errors.As(err, &le) {
 			if emit != nil {
@@ -314,7 +334,7 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 		l.Usage.InputTokens += l.wireTokens
 
 		feed := dialect.NewDialectFeed()
-		for ev := range l.gateway.Stream(context.Background(), l.wire, l.tools.Schemas(), 0) {
+		for ev := range l.gateway.Stream(l.ctx, l.wire, l.tools.Schemas(), 0) {
 			switch ev.Kind {
 			case gateway.EventContent:
 				for _, e := range feed.Feed(ev.Text) {
@@ -340,6 +360,9 @@ func (l *AgentLoop) oneStep(emit func(AgentEvent)) (string, error) {
 		}
 		for _, e := range feed.Flush() {
 			l.route(e, &contentParts, &reasoningParts, &healedCalls, emit)
+		}
+		if l.ctx.Err() != nil {
+			return "", ErrCancelled
 		}
 
 		if len(structuredCalls) > 0 {
@@ -635,7 +658,7 @@ func (l *AgentLoop) executeMany(calls []messages.ToolCall, emit func(AgentEvent)
 			if emit != nil {
 				emit(AgentEvent{Kind: EventToolStart, Call: call})
 			}
-			res := l.runOne(context.Background(), call)
+			res := l.runOne(l.ctx, call)
 			var err error
 			if sessionEvents, err = l.recordResult(call, res, emit, sessionEvents); err != nil {
 				return sessionEvents, err
