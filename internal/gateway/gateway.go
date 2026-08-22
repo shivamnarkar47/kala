@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kaal/kaal/internal/config"
@@ -162,7 +163,9 @@ func BuildBody(modelID string, msgs []any, tools []any, maxTokens int) ChatBody 
 
 func buildHeaders(apiKey string) http.Header {
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+apiKey)
+	if apiKey != "" {
+		h.Set("Authorization", "Bearer "+apiKey)
+	}
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	// Cloudflare WAF (error 1010) blocks urllib's default UA; this value is
@@ -330,6 +333,12 @@ type Gateway struct {
 	// Opener overrides the transport seam (batch workers pass their own
 	// per-worker transport); nil = the package default.
 	Opener Opener
+
+	// Command Code Go-plan transport memory (commandcode.go): which of the
+	// two endpoints the current credential works with.
+	ccMu        sync.Mutex
+	ccTransport string // "", "unknown", "provider", "generate"
+	ccKey       string // the key the transport was resolved with
 }
 
 // ModelID returns the configured model id (the loop's Gateway seam).
@@ -355,6 +364,12 @@ func (g *Gateway) Stream(ctx context.Context, msgs []any, tools []any, maxTokens
 
 func (g *Gateway) stream(ctx context.Context, ch chan<- StreamEvent, msgs []any, tools []any, maxTokens int) {
 	defer close(ch)
+	// A remembered Go-plan credential goes straight to the generate
+	// endpoint — no point re-probing the Provider API every turn.
+	if g.recallTransport() == "generate" {
+		g.streamGenerate(ctx, ch, msgs, tools, maxTokens)
+		return
+	}
 	body, err := jsonpy.Marshal(BuildBody(g.Model, msgs, tools, maxTokens))
 	if err != nil {
 		ch <- StreamEvent{Kind: EventError, Text: "gateway: marshal body: " + err.Error()}
@@ -377,6 +392,9 @@ func (g *Gateway) stream(ctx context.Context, ch chan<- StreamEvent, msgs []any,
 			}
 		})
 		if err == nil {
+			if commandCodeBase(g.BaseURL) {
+				g.rememberTransport("provider")
+			}
 			return
 		}
 		if errors.Is(err, errEmitAbort) || ctx.Err() != nil {
@@ -384,6 +402,15 @@ func (g *Gateway) stream(ctx context.Context, ch chan<- StreamEvent, msgs []any,
 		}
 		switch e := err.(type) {
 		case *HTTPStatusError:
+			// The Go plan has no Provider API access: its 403 carries code
+			// upgrade_required, and /alpha/generate is the working route.
+			// Only that exact answer flips transports — never other errors.
+			if e.Code == http.StatusForbidden && commandCodeBase(g.BaseURL) &&
+				isUpgradeRequired(e.Body) && !emittedAny {
+				g.rememberTransport("generate")
+				g.streamGenerate(ctx, ch, msgs, tools, maxTokens)
+				return
+			}
 			if e.Code >= 400 && e.Code < 500 && e.Code != 429 {
 				// Code/key problem — never retry.
 				ch <- StreamEvent{Kind: EventError, Text: fmt.Sprintf("gateway HTTP %d: %s", e.Code, preview(e.Body))}

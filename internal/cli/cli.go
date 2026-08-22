@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -298,7 +299,13 @@ func batchAsk(question string, options []string) string {
 var runGatewayBaseURL = ""
 
 func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io.Writer, askHandler func(string, []string) string) runRecord {
-	key, err := config.GetAPIKey()
+	// Model first: the provider decides which key chain resolves. Free-tier
+	// zen models are the exception — they need no key at all.
+	modelID := config.ResolveModelID(opts.model)
+	key, err := config.GetAPIKeyFor(config.ModelProvider(modelID))
+	if err != nil && config.FreeTierModel(modelID) {
+		key, err = "", nil
+	}
 	if err != nil {
 		// Missing/invalid key: config already printed the instructions.
 		fmt.Fprintln(stderr, err)
@@ -333,7 +340,6 @@ func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io
 		cache = toolcache.NewToolCache(filepath.Join(projectDir, ".kaal", "tool-cache.json"))
 	}
 	toolRegistry := tools.NewRegistry(projectDir, opts.allowDangerous, cache, mem)
-	modelID := config.ResolveModelID(opts.model)
 	baseURL := config.ModelBaseURL(modelID)
 	if runGatewayBaseURL != "" {
 		baseURL = runGatewayBaseURL
@@ -353,7 +359,17 @@ func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io
 		loop.WithSessionWriter(opts.sessionWriter),
 	)
 	toolCalls := 0
+	connectHost := baseURL
+	if u, err := url.Parse(baseURL); err == nil && u.Host != "" {
+		connectHost = u.Host
+	}
+	fmt.Fprintf(stderr, "◌ opening %s · %s…\r", connectHost, modelID)
+	noted := false // flips on the stream's first sign of life
 	emit := func(ev loop.AgentEvent) {
+		if !noted {
+			noted = true
+			fmt.Fprint(stderr, "\r\033[2K") // erase the connecting line in place
+		}
 		switch ev.Kind {
 		case loop.EventContent:
 			fmt.Fprint(stdout, ev.Text)
@@ -370,6 +386,9 @@ func runOne(prompt string, opts *runOptions, sessionID string, stdout, stderr io
 
 	stop := startProgress(opts, stderr)
 	answer, runErr := agentLoop.Run(prompt, emit)
+	if !noted {
+		fmt.Fprint(stderr, "\r\033[2K") // nothing ever streamed: clear the line
+	}
 	if stop != nil {
 		stop()
 		clearProgressLine(stderr)
@@ -672,7 +691,12 @@ func runDoctor(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "terminal: %s (font: see docs/terminal-setup.md)\n", terminal)
 
 	keySource := apiKeySource()
-	fmt.Fprintf(stdout, "api key: %s\n", keySource)
+	freeDefault := config.FreeTierModel(config.ResolveModelID(""))
+	if keySource == "MISSING" && freeDefault {
+		fmt.Fprintln(stdout, "api key: none (zen free tier is keyless)")
+	} else {
+		fmt.Fprintf(stdout, "api key: %s\n", keySource)
+	}
 
 	gatewayOK := gatewayReachable()
 	fmt.Fprintf(stdout, "gateway: %s\n", map[bool]string{true: "reachable", false: "unreachable"}[gatewayOK])
@@ -695,7 +719,7 @@ func runDoctor(stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "sessions dir: %s · %d files\n", store, fileCount)
 
-	ok := keySource != "MISSING" && gatewayOK
+	ok := (keySource != "MISSING" || freeDefault) && gatewayOK
 	if !ok {
 		fmt.Fprintln(stdout, "doctor: FAILED")
 		return &exitError{code: 1}
@@ -703,9 +727,19 @@ func runDoctor(stdout io.Writer) error {
 	return nil
 }
 
-// apiKeySource reports which API-key source resolves, without ever printing
-// the key itself.
+// apiKeySource reports which API-key source resolves for the default model's
+// provider, without ever printing the key itself.
 func apiKeySource() string {
+	provider := config.ModelProvider(config.ResolveModelID(""))
+	if provider == config.ProviderCommandCode {
+		if os.Getenv("CMD_API_KEY") != "" || os.Getenv("COMMANDCODE_API_KEY") != "" {
+			return "env"
+		}
+		if config.LoadUserAPIKeyFor(provider) != "" {
+			return "user store"
+		}
+		return "MISSING"
+	}
 	if os.Getenv("OPENCODE_API_KEY") != "" {
 		return "env"
 	}

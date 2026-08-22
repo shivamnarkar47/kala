@@ -139,7 +139,7 @@ func TestRunJSONRecord(t *testing.T) {
 	if record["session_id"] == "" || record["answer"] != "Hello from the gateway.\n" {
 		t.Fatalf("record: %v", record)
 	}
-	if record["model"] != "deepseek-v4-flash" {
+	if record["model"] != config.ModelID { // the shipped default rides the free tier
 		t.Fatalf("model: %v", record["model"])
 	}
 	steps, ok := record["steps"].(float64)
@@ -162,7 +162,10 @@ func TestRunJSONRecord(t *testing.T) {
 func TestRunNoAPIKey(t *testing.T) {
 	t.Setenv("OPENCODE_API_KEY", "")
 	t.Setenv("KAAL_SESSIONS_DIR", t.TempDir())
-	code, _, errOut := runMain(t, "", "run", "hi", "--dir", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("HOME", t.TempDir()) // isolate the CLI auth file + omp fallbacks
+	// Pin a keyed model: the free-tier default is keyless by design.
+	code, _, errOut := runMain(t, "", "run", "hi", "--dir", t.TempDir(), "--model", "deepseek-v4-flash")
 	if code != 1 {
 		t.Fatalf("code %d", code)
 	}
@@ -463,6 +466,13 @@ func TestDoctorFailsWithoutKey(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("OPENCODE_API_KEY", "")
 	t.Setenv("KAAL_SESSIONS_DIR", filepath.Join(dir, "sessions"))
+	// Isolate config before pinning a keyed (paid) model: the free-tier
+	// default is keyless by design and must NOT fail the doctor.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	t.Setenv("HOME", t.TempDir()) // isolate the CLI auth file + omp fallbacks
+	if err := config.SaveUserModel("deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
 	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -882,4 +892,29 @@ func TestResolveCheckoutAcceptsGitlessTarballDir(t *testing.T) {
 	if got := resolveCheckout(); got != checkout {
 		t.Fatalf("gitless checkout: %q", got)
 	}
+}
+
+func TestRunFreeTierKeyless(t *testing.T) {
+	// The zen free tier needs no login: with every key source empty, a
+	// free-tier model still answers.
+	f, dir := setupCLI(t, answerSSE, 200)
+	t.Setenv("OPENCODE_API_KEY", "")
+	t.Setenv("CMD_API_KEY", "")
+	t.Setenv("COMMANDCODE_API_KEY", "")
+	t.Setenv("HOME", t.TempDir()) // isolate the omp fallback too
+
+	code, out, errOut := runMain(t, "", "run", "Say hello", "--dir", dir)
+	if code != 0 {
+		t.Fatalf("code %d (stderr %q)", code, errOut)
+	}
+	if !strings.Contains(out, "Hello from the gateway.") {
+		t.Fatalf("answer missing: %q", out)
+	}
+
+	// A paid model with no key anywhere must still fail fast.
+	code, _, errOut = runMain(t, "", "run", "hi", "--dir", dir, "--model", "deepseek-v4-flash")
+	if code != 1 || !strings.Contains(errOut, "no API key") {
+		t.Fatalf("paid model keyless: code=%d err=%q", code, errOut)
+	}
+	_ = f
 }

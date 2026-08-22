@@ -141,3 +141,18 @@ session: hi → ok
 
 ## 2026-08-17 — release-fetch update + Windows bash parity
 Both war-record open questions landed. `kaal update` now falls back to a prebuilt release binary when there is no git+go toolchain (or no checkout at all): fetch the `kaal-<goos>-<goarch>[.exe]` asset from the GitHub latest-release API, probe the downloaded binary with `--version`, compare dotted versions, and atomically swap the running executable. The `bash` tool runs `cmd.exe /C` with a `System32`-aware PATH on Windows (`/bin/sh -c` + POSIX dirs elsewhere; venv `Scripts`/`bin` both probed). First release SHIPPED 2026-08-17: tag `v0.3`, GitHub Release with all six `kaal-<os>-<arch>` assets, built by the new release workflow. Release-fetch verified end-to-end against production (`/tmp/e2e-kaal update` with no checkout → fetched the real linux-amd64 asset, probed `kaal 0.3`, reported up to date). CI fixes found along the way: `ResolveRelative` base-symlink bug (macOS /var → /private/var made every in-project path look like an escape), PowerShell-vs-bash `${GITHUB_REF_NAME#v}` stamp bug on the Windows release build, cross-arch probe gating, CR-tolerance, and Windows skips for the sh-script fake-toolchain tests.
+
+## 2026-08-23 02:12
+session: How fast is this harness? Check the retry/backoff constants in internal/gateway/gateway.go, then answer in two sentences. → ok
+
+## 2026-08-23 02:27
+session: In one sentence: what backoff does the gateway use? → ok
+
+## 2026-08-23 03:07
+session: Reply with exactly: KAAL-GO-OX-OK → ok
+
+## 2026-08-23 03:09
+session: What brings u here ? → ok
+
+## 2026-08-23 04:05
+session: How are u ? → ok

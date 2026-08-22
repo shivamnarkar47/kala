@@ -15,9 +15,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,38 +57,16 @@ const (
 	maxResultPreview    = 160
 	maxComposerLines    = 5
 	sidebarWidth        = 34
+	appPadding          = 4 // the whole window floats inside a 4-cell frame
 )
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-
-// The homepage — Kurukshetra, the field of dharma. The chakra (the wheel of
-// the chariot's dharma), the KAAL wordmark, the five Pandava agents, and the
-// first actions.
-var (
-	chakraArt = `        ╔═══════════════╗
-      ╔═╝               ╚═╗
-     ╔╝                   ╚╗
-    ╔╝                     ╚╗
-    ║   ╔═══╗      ╔═══╗    ║
-    ║   ║   ║      ║   ║    ║
-    ║   ╚═╗ ╚═╦══╦═╝ ╔═╝    ║
-    ║     ║   ║  ║   ║      ║
-    ║   ╔═╝ ╔═╩══╩═╗ ╚═╗    ║
-    ║   ║   ║      ║   ║    ║
-    ║   ╚═══╝      ╚═══╝    ║
-    ╚╗                     ╔╝
-     ╚╗                   ╔╝
-      ╚═╗               ╔═╝
-        ╚═══════════════╝`
-
-	// The KAAL wordmark in block glyphs (ported from the Python camp's
-	// art.py) — the home-screen hero.
-	kaalArt = `▄▄▄   ▄▄▄             ▄▄                ▄▄▄
+// The KAAL wordmark in block glyphs (ported from the Python camp's art.py)
+// — the home-screen hero, crowned by Arjuna's chariot (theme.go).
+var kaalArt = `▄▄▄   ▄▄▄             ▄▄                ▄▄▄
 ███ ▄███▀             ██                ███            ▄▄
 ███████   ▄█▀█▄ ▄█▀▀▀ ████▄  ▀▀█▄ ██ ██ ███      ▄███▄ ██ ▄█▀
 ███▀███▄  ██▄█▀ ▀███▄ ██ ██ ▄█▀██ ██▄██ ███      ██ ██ ████
 ███  ▀███ ▀█▄▄▄ ▄▄▄█▀ ██ ██ ▀█▄██  ▀█▀  ████████ ▀███▀ ██ ▀█▄`
-)
 
 const (
 	homeTitle   = "KURUKSHETRA"
@@ -100,12 +83,6 @@ Pandavas>", "description": "<one or two sentences describing the persona's
 strengths and style>"}.`
 
 const agentGeneratorMaxTokens = 300
-
-var slashCommands = []string{
-	"/help", "/new", "/resume", "/sessions", "/models", "/connect",
-	"/memory", "/model", "/verbose", "/sidebar", "/structure",
-	"/diagram", "/diagrams", "/topbar", "/agents", "/quit",
-}
 
 var mermaidFenceRe = regexp.MustCompile("(?s)```mermaid\n(.*?)```")
 
@@ -173,6 +150,8 @@ const (
 	modalAgents
 	modalAgentForm
 	modalAgentIntent
+	modalProviders
+	modalCustomProvider
 )
 
 type modal struct {
@@ -188,6 +167,47 @@ type modal struct {
 	askQuestion string
 	askOptions  []string
 	askChan     chan string
+}
+
+// Provider picker items (raw values; modalView decorates).
+const (
+	pickOpencode   = "opencode"    // zen/v1 — the keyless free tier
+	pickOpencodeGo = "opencode-go" // zen/go/v1 — the paid opencode route
+	pickCommand    = "commandcode"
+	pickAddAnother = "@add"
+)
+
+// keyProviderFor resolves which credential chain a picker choice needs:
+// both opencode tiers share the OPENCODE_API_KEY chain.
+func keyProviderFor(pick string) string {
+	if pick == pickCommand {
+		return config.ProviderCommandCode
+	}
+	return config.ProviderOpencode
+}
+
+// providerDisplayName prettifies a picker choice for titles and notices.
+func providerDisplayName(pick string) string {
+	switch pick {
+	case pickOpencode:
+		return "opencode free"
+	case pickOpencodeGo:
+		return "opencode go"
+	case pickCommand:
+		return "command-code"
+	}
+	return pick
+}
+
+// customProviderForm carries the add-another-provider fields out of its
+// modal into closeModal.
+type customProviderForm struct{ baseURL, apiKey string }
+
+// customModelsMsg lands the fetched model list of a BYOK endpoint.
+type customModelsMsg struct {
+	name, baseURL, apiKey string
+	ids                   []string
+	err                   error
 }
 
 // -- model -----------------------------------------------------------------------
@@ -223,7 +243,8 @@ type Model struct {
 	totalCost     float64
 
 	// view state
-	width, height  int
+	width, height  int // the terminal's true size
+	innerW, innerH int // inside the app frame (terminal minus 2×appPadding)
 	viewport       viewport.Model
 	input          textarea.Model
 	sidebarVisible bool
@@ -235,19 +256,27 @@ type Model struct {
 	transcript     []string
 	modal          *modal
 
-	// slash-command suggestions popup
+	// slash-command suggestions popup (the palette)
 	suggestionsVisible bool
-	suggestions        []string
+	suggestions        []*slashCommand
 	suggestIndex       int
+	suggestDismissed   bool
+	lastSuggestInput   string
 
 	// mermaid auto-render + AI agent generator
 	diagramsEnabled bool
 	generatingAgent bool
 	homeMirrored    bool
 
+	// provider flow: the provider awaiting its key (picker → connect →
+	// models), and whether an open models modal finalizes a BYOK choice.
+	pendingProvider  string
+	pickingForCustom bool
+
 	// turn state
 	turnActive    bool
 	thinking      bool
+	connecting    bool // waiting for the stream's first byte
 	thinkFrame    int
 	cancelTurn    context.CancelFunc
 	blocks        []block
@@ -259,14 +288,13 @@ type Model struct {
 	lastTickTime  time.Time
 	rate          float64
 	mdRenderer    *glamour.TermRenderer
+	freeKeyless   bool // running a zen free-tier model with no login at all
 
 	// styles
-	agentStyle     lipgloss.Style
 	rightStyle     lipgloss.Style
 	dimStyle       lipgloss.Style
 	errorStyle     lipgloss.Style
 	userLabelStyle lipgloss.Style
-	assistantLabel lipgloss.Style
 }
 
 // New builds the workbench (mirrors HarnessTui.__init__): resolves the key,
@@ -281,11 +309,12 @@ func New(projectDir string, maxSteps int, allowDangerous bool) (*Model, error) {
 		projectDir = cwd
 	}
 	modelID := config.ResolveModelID("")
-	key, err := config.GetAPIKey()
-	keyMissing := err != nil
-	if keyMissing {
-		// Start anyway: the workbench is usable for /connect, /memory,
-		// /sessions, browsing; only sending needs a key.
+	key, keyErr := config.GetAPIKeyFor(config.ModelProvider(modelID))
+	// Free-tier zen models run with no login at all; anything else needs a
+	// resolvable key before sending.
+	keyMissing := keyErr != nil && !config.FreeTierModel(modelID)
+	freeKeyless := keyErr != nil && config.FreeTierModel(modelID)
+	if keyErr != nil {
 		key = ""
 	}
 	gw := &gateway.Gateway{BaseURL: config.ModelBaseURL(modelID), APIKey: key, Model: modelID}
@@ -293,6 +322,7 @@ func New(projectDir string, maxSteps int, allowDangerous bool) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	m.freeKeyless = freeKeyless
 	if keyMissing {
 		m.keyMissing = true
 		m.appendNotice("no API key — save one with /connect <key> to start chatting")
@@ -301,10 +331,20 @@ func New(projectDir string, maxSteps int, allowDangerous bool) (*Model, error) {
 }
 
 // applySavedKey pushes a key saved via /connect into the live gateway and
-// clears the missing-key state so the next turn can run. No-op when no key
-// is stored yet (the save failed or nothing was entered).
+// clears the missing-key state so the next turn can run. The store is scoped
+// to the active model's provider. No-op when no key is stored yet (the save
+// failed or nothing was entered).
 func (m *Model) applySavedKey() {
-	key := config.LoadUserAPIKey()
+	m.applySavedKeyFor(config.ModelProvider(m.modelID))
+}
+
+// applySavedKeyFor loads the named provider's stored key into the live
+// gateway and clears the missing-key state.
+func (m *Model) applySavedKeyFor(provider string) {
+	key := config.LoadUserAPIKeyFor(provider)
+	if cp := config.LoadCustomProvider(); provider == cpName(cp) && cp != nil && key == "" {
+		key = cp.APIKey
+	}
 	if key == "" {
 		return
 	}
@@ -313,6 +353,136 @@ func (m *Model) applySavedKey() {
 	}
 	m.keyMissing = false
 }
+
+func cpName(cp *config.CustomProvider) string {
+	if cp == nil {
+		return ""
+	}
+	return cp.Name
+}
+
+// providerFlow runs one picker selection: with a resolvable key it goes
+// straight to that route's model list; otherwise the Diksha modal asks
+// for the key first, then the models follow (the connect-close handler
+// chains via pendingProvider).
+func (m *Model) providerFlow(pick string) {
+	if _, err := config.GetAPIKeyFor(keyProviderFor(pick)); err == nil {
+		m.openProviderModels(pick)
+		return
+	}
+	m.pendingProvider = pick
+	m.openConnectModal()
+}
+
+// startCustomProvider probes a BYOK endpoint's live model list on a worker
+// goroutine; the result lands as customModelsMsg and opens the picker.
+func (m *Model) startCustomProvider(baseURL, apiKey string) {
+	name := deriveProviderName(baseURL)
+	m.appendNotice("probing " + strings.TrimRight(baseURL, "/") + "/models …")
+	send := m.sendFn
+	go func() {
+		ids, err := fetchProviderModels(baseURL, apiKey)
+		send(customModelsMsg{name: name, baseURL: baseURL, apiKey: apiKey, ids: ids, err: err})
+	}()
+}
+
+// onCustomModels stores a working BYOK endpoint and offers its fetched
+// model list; the pick finalizes the provider's model.
+func (m *Model) onCustomModels(msg customModelsMsg) {
+	if msg.err != nil {
+		m.appendError("add provider: " + msg.err.Error())
+		return
+	}
+	if len(msg.ids) == 0 {
+		m.appendError("add provider: " + msg.baseURL + " listed no models")
+		return
+	}
+	cp := config.CustomProvider{Name: msg.name, BaseURL: msg.baseURL, APIKey: msg.apiKey}
+	if err := config.SaveCustomProvider(cp); err != nil {
+		m.appendError("add provider: " + err.Error())
+		return
+	}
+	m.pickingForCustom = true
+	m.openListModal(modalModels, "Astras — "+cp.Name+" (pick one)", msg.ids)
+}
+
+// deriveProviderName names a BYOK provider after its host: api.together.xyz
+// → "together"; hosts without a usable label fall back to "custom".
+func deriveProviderName(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	host := ""
+	if err == nil {
+		host = strings.ToLower(u.Hostname())
+	}
+	if host == "" || host == "localhost" || net.ParseIP(host) != nil {
+		return "custom"
+	}
+	parts := strings.Split(host, ".")
+	for len(parts) > 0 && (parts[0] == "api" || parts[0] == "www") {
+		parts = parts[1:]
+	}
+	if len(parts) > 1 {
+		parts = parts[:len(parts)-1] // drop the TLD
+	}
+	name := strings.Join(parts, "-")
+	if name == "" {
+		return "custom"
+	}
+	return name
+}
+
+// fetchProviderModels GETs an OpenAI-compatible endpoint's model list
+// ({"data":[{"id":…}]} shape, with tolerant fallbacks). Never logs the key.
+func fetchProviderModels(baseURL, apiKey string) ([]string, error) {
+	url := strings.TrimRight(baseURL, "/") + "/models"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("User-Agent", doctorSafeUA)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	var doc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("could not parse the model list from %s", url)
+	}
+	raw := doc.Data
+	if len(raw) == 0 {
+		raw = doc.Models
+	}
+	ids := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		if entry.ID != "" {
+			ids = append(ids, entry.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// doctorSafeUA is the proven User-Agent: default Go UAs are WAF-blocked by
+// some gateways (see cli.go gatewayReachable).
+const doctorSafeUA = "kaal/0.3 (+https://github.com/kaal/kaal)"
 
 // NewWithGateway builds the workbench around an injected gateway (tests
 // pass a fake; New uses the real one).
@@ -359,12 +529,10 @@ func NewWithGateway(gw loop.Gateway, projectDir, modelID string, maxSteps int, a
 		diagramsEnabled: true,
 		agentsState:     agentState,
 		sendFn:          func(tea.Msg) {}, // no-op until Main wires the program
-		agentStyle:      lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("15")).Bold(true),
-		rightStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		dimStyle:        lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
-		errorStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("203")),
-		userLabelStyle:  lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true),
-		assistantLabel:  lipgloss.NewStyle().Foreground(lipgloss.Color("79")).Bold(true),
+		rightStyle:      lipgloss.NewStyle().Foreground(colorDim),
+		dimStyle:        lipgloss.NewStyle().Foreground(colorDim),
+		errorStyle:      lipgloss.NewStyle().Foreground(colorEmber),
+		userLabelStyle:  lipgloss.NewStyle().Foreground(colorSaffron).Bold(true),
 	}
 	m.input = textarea.New()
 	m.input.Placeholder = "Message kaal — /help for commands"
@@ -403,6 +571,7 @@ func (m *Model) Submit(task string) tea.Cmd {
 	m.steps = 0
 	m.turnActive = true
 	m.thinking = true
+	m.connecting = true // until the stream's first event lands
 	m.thinkFrame = 0
 	m.mdPending = ""
 	m.flushArmed = false
@@ -411,6 +580,9 @@ func (m *Model) Submit(task string) tea.Cmd {
 	m.rate = 0
 	m.turnStart = time.Now()
 	m.lastTickTime = m.turnStart
+	// The indicator must appear the moment Enter lands — not when the
+	// server's first byte does.
+	m.renderConversation()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelTurn = cancel
@@ -485,12 +657,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case thinkTickMsg:
 		if m.thinking && m.turnActive {
 			m.thinkFrame = msg.frame + 1
+			// Animate even while nothing streams: the chakra must turn
+			// during the silent connect/think window too.
+			m.renderConversation()
 			cmds = append(cmds, tea.Tick(thinkingTick, func(t time.Time) tea.Msg {
 				return thinkTickMsg{frame: m.thinkFrame}
 			}))
 		}
 	case openAskMsg:
 		m.openAskModal(msg)
+	case customModelsMsg:
+		m.onCustomModels(msg)
 	case diagramArtMsg:
 		m.onDiagramArt(msg)
 	case agentDoneMsg:
@@ -673,23 +850,58 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return nil // a modal is already up; don't stack another
 		}
 		m.openAgentIntentModal()
-	case "tab", "shift+tab":
+	case "up", "down":
 		if m.suggestionsVisible && len(m.suggestions) > 0 {
-			if msg.String() == "shift+tab" {
-				m.suggestIndex = (m.suggestIndex - 1 + len(m.suggestions)) % len(m.suggestions)
+			n := len(m.suggestions)
+			if msg.String() == "up" {
+				m.suggestIndex--
 			} else {
-				m.suggestIndex = (m.suggestIndex + 1) % len(m.suggestions)
+				m.suggestIndex++
 			}
-			m.input.SetValue(m.suggestions[m.suggestIndex])
+			m.suggestIndex = ((m.suggestIndex % n) + n) % n
+			return nil
+		}
+	case "esc":
+		if m.suggestionsVisible {
+			m.suggestDismissed = true
+			m.updateSuggestions()
+			return nil
+		}
+	case "tab":
+		if m.suggestionsVisible && len(m.suggestions) > 0 {
+			c := m.suggestions[m.suggestIndex]
+			completed := c.name
+			if c.args != "" {
+				completed += " "
+			}
+			m.input.SetValue(completed)
 			m.input.CursorEnd()
+			m.updateSuggestions()
 			return nil
 		}
 		m.input.InsertString("\t")
 		return nil
 	case "enter":
 		if !isShift(msg) {
-			value := m.input.Value()
-			if strings.HasPrefix(strings.TrimSpace(value), "/") {
+			value := strings.TrimSpace(m.input.Value())
+			if strings.HasPrefix(value, "/") {
+				head := value
+				if i := strings.IndexAny(value, " \t"); i >= 0 {
+					head = value[:i]
+				}
+				if slashFind(head) == nil && m.suggestionsVisible && len(m.suggestions) > 0 {
+					// A partial command completes from the palette instead of
+					// dying as "unknown" — the palette's cursor picks which.
+					c := m.suggestions[m.suggestIndex]
+					completed := c.name
+					if c.args != "" {
+						completed += " "
+					}
+					m.input.SetValue(completed)
+					m.input.CursorEnd()
+					m.updateSuggestions()
+					return nil
+				}
 				m.input.Reset()
 				m.updateSuggestions()
 				m.runCommand(value)
@@ -706,26 +918,27 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-// updateSuggestions shows the slash-command popup when the input starts
-// with "/".
+// updateSuggestions drives the command palette: visible while the composer
+// starts with "/", matching names first and descriptions second; esc
+// dismisses until the input changes again.
 func (m *Model) updateSuggestions() {
 	value := m.input.Value()
-	if strings.HasPrefix(value, "/") {
-		filter := strings.ToLower(value[1:])
-		var matches []string
-		for _, c := range slashCommands {
-			if strings.Contains(c, "/"+filter) {
-				matches = append(matches, c)
-			}
-		}
-		m.suggestions = matches
-		m.suggestionsVisible = len(matches) > 0
-		if m.suggestIndex >= len(m.suggestions) {
-			m.suggestIndex = 0
-		}
-	} else {
+	if value != m.lastSuggestInput {
+		m.suggestDismissed = false
+		m.lastSuggestInput = value
+	}
+	if !strings.HasPrefix(value, "/") {
 		m.suggestionsVisible = false
 		m.suggestions = nil
+		m.suggestIndex = 0
+		return
+	}
+	m.suggestions = slashMatches(value)
+	m.suggestionsVisible = len(m.suggestions) > 0 && !m.suggestDismissed
+	switch {
+	case m.suggestIndex >= len(m.suggestions):
+		m.suggestIndex = 0
+	case m.suggestIndex < 0:
 		m.suggestIndex = 0
 	}
 }
@@ -741,8 +954,7 @@ func (m *Model) runCommand(text string) {
 	}
 	switch cmd {
 	case "/help":
-		m.appendNotice("commands: /help /new /resume <id> /sessions /models /connect /memory /model /verbose /sidebar /structure /quit")
-		m.appendNotice("keys: enter send · shift+enter newline · ctrl+p/n history · ctrl+l bottom · ctrl+s sidebar · ctrl+c cancel · ctrl+q quit")
+		m.appendNotice(m.renderHelpPanel())
 	case "/new":
 		m.sessionID = sessions.NewSessionID()
 		m.resumeNext = false
@@ -771,18 +983,18 @@ func (m *Model) runCommand(text string) {
 		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
 			ids[i], ids[j] = ids[j], ids[i]
 		}
-		m.openListModal(modalSessions, "Sessions", ids)
+		m.openListModal(modalSessions, "Itihasa — sessions", ids)
 	case "/models":
 		ids := make([]string, 0, len(config.Models))
 		for _, model := range config.Models {
 			ids = append(ids, model.ID)
 		}
-		m.openListModal(modalModels, "Models", ids)
+		m.openListModal(modalModels, "Astras — models", ids)
 	case "/agents":
 		state := agents.Load(m.projectDir)
 		m.agentsState = state
 		names := agents.AgentNames(state)
-		m.openListModal(modalAgents, "Agents", names)
+		m.openListModal(modalAgents, "Sabha — the assembly", names)
 	case "/diagram":
 		if arg == "" {
 			m.appendNotice("usage: /diagram <file.mmd>")
@@ -800,14 +1012,14 @@ func (m *Model) runCommand(text string) {
 		m.topbarVisible = !m.topbarVisible
 	case "/connect":
 		if arg != "" {
-			if err := config.SaveUserAPIKey(arg); err != nil {
+			if err := config.SaveUserAPIKeyFor(config.ModelProvider(m.modelID), arg); err != nil {
 				m.appendError("could not save API key: " + err.Error())
 			} else {
 				m.applySavedKey() // inline key, no popup
 				m.appendNotice("api key saved")
 			}
 		} else {
-			m.openConnectModal()
+			m.openProviderModal()
 		}
 	case "/memory":
 		digest := m.mem.LoadDigest()
@@ -838,13 +1050,23 @@ func (m *Model) runCommand(text string) {
 	case "/quit":
 		m.sendFn(tea.Quit())
 	default:
-		m.appendNotice("unknown command: " + cmd + " (try /help)")
+		msg := "unknown command: " + cmd
+		if near := slashNearest(cmd); near != "" && near != cmd {
+			msg += " — did you mean " + near + "?"
+		} else {
+			msg += " (try /help)"
+		}
+		m.appendNotice(msg)
 	}
 }
 
 // -- turn events -------------------------------------------------------------------
 
 func (m *Model) onLoopEvent(ev loop.AgentEvent) tea.Cmd {
+	if m.connecting && ev.Kind != loop.EventDone {
+		// First sign of life from the gateway: the connection is open.
+		m.connecting = false
+	}
 	switch ev.Kind {
 	case loop.EventStep:
 		m.steps = ev.Step
@@ -900,6 +1122,7 @@ func (m *Model) onLoopEvent(ev loop.AgentEvent) tea.Cmd {
 
 func (m *Model) onTurnDone(err error) {
 	m.thinking = false
+	m.connecting = false
 	m.flushMD()
 	m.closeUnclosedFence()
 	m.renderConversation()
@@ -922,17 +1145,26 @@ func (m *Model) onTurnDone(err error) {
 // -- rendering helpers ----------------------------------------------------------------
 
 func (m *Model) resize() {
+	// Everything lives inside the app frame: terminal minus 4-cell padding.
+	m.innerW = m.width - 2*appPadding
+	m.innerH = m.height - 2*appPadding
+	if m.innerW < 20 {
+		m.innerW = 20
+	}
+	if m.innerH < 10 {
+		m.innerH = 10
+	}
 	sidebar := 0
 	if m.sidebarVisible {
 		sidebar = sidebarWidth
 	}
-	convW := m.width - sidebar
+	convW := m.innerW - sidebar
 	if convW < 20 {
 		convW = 20
 	}
 	statusH := 1
 	composerH := 4
-	convH := m.height - statusH - composerH
+	convH := m.innerH - statusH - composerH
 	if convH < 5 {
 		convH = 5
 	}
@@ -946,7 +1178,7 @@ func (m *Model) resize() {
 }
 
 func (m *Model) rebuildRenderer() {
-	width := m.width - 2
+	width := m.innerW - 2
 	if m.sidebarVisible {
 		width -= sidebarWidth
 	}
@@ -973,18 +1205,72 @@ func (m *Model) renderMarkdown(text string) string {
 	return rendered
 }
 
-// renderHome renders the branded empty state: the chakra, the wordmark, the
-// title, the Pandava cast, and the first actions. Shown on a fresh session
-// (and after /new) — mirrored to the transcript once.
+// -- Kurukshetra regalia -----------------------------------------------------------
+
+// activeAgentName resolves the persona speaking right now: the active
+// Pandava, or plain "kaal" when none is set.
+func (m *Model) activeAgentName() string {
+	if m.agent != nil && m.agent.Name != "" {
+		return m.agent.Name
+	}
+	return "kaal"
+}
+
+// agentBadge renders the compact banner badge (status bar): dark sigil +
+// name on the Pandava's color.
+func (m *Model) agentBadge(name string) string {
+	id := identityFor(name)
+	return lipgloss.NewStyle().
+		Background(id.color).
+		Foreground(lipgloss.Color("16")).
+		Bold(true).
+		Render(" " + id.glyph + " " + name + " ")
+}
+
+// agentChip is the badge with the epic byname beside it (home cast row,
+// agents modal).
+func (m *Model) agentChip(name string) string {
+	id := identityFor(name)
+	chip := m.agentBadge(name)
+	if id.epithet != "" {
+		chip += m.dimStyle.Render(" " + id.epithet)
+	}
+	return chip
+}
+
+// streamHost names where the current turn is dialing — the gateway host
+// when available, the model id otherwise.
+func (m *Model) streamHost() string {
+	if g, ok := m.gateway.(*gateway.Gateway); ok {
+		if u, err := url.Parse(g.BaseURL); err == nil && u.Host != "" {
+			return u.Host
+		}
+	}
+	return m.modelID
+}
+
+// assistantStyle dresses the answering persona's label in its own color.
+func assistantStyle(name string) lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(identityFor(name).color).Bold(true)
+}
+
+// renderHome renders the branded empty state: the wordmark over Arjuna's
+// chariot, the KURUKSHETRA title and tagline, the Gita verse kaal works by,
+// the first actions, and the Pandava cast in their own colors. Shown on a
+// fresh session (and after /new) — mirrored to the transcript once.
 func (m *Model) renderHome() {
 	var sb strings.Builder
-	sb.WriteString(m.dimStyle.Render(chakraArt))
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorGold).Render(kaalArt))
 	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("79")).Render(kaalArt))
+	sb.WriteString(m.dimStyle.Render(chariotArt))
 	sb.WriteString("\n\n")
-	sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("222")).Render(homeTitle))
+	sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render(homeTitle))
 	sb.WriteString("\n")
 	sb.WriteString(m.dimStyle.Render(homeTagline))
+	sb.WriteString("\n")
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorIvory).Render(gitaVerse))
+	sb.WriteString("\n")
+	sb.WriteString(m.dimStyle.Render(gitaGloss))
 	sb.WriteString("\n\n")
 	// The first actions sit right after the tagline so the welcome + session
 	// are in view even on short terminals (the cast below is decorative).
@@ -995,12 +1281,16 @@ func (m *Model) renderHome() {
 		sb.WriteString("\n")
 	}
 	sb.WriteString(m.dimStyle.Render("kaal 0.3 · " + m.modelID + " · " + m.sessionID))
-	sb.WriteString("\n\n")
-	// The cast: the five Pandava agent blocks, each styled like the status
-	// bar's agent segment.
+	sb.WriteString("\n")
+	if m.freeKeyless {
+		sb.WriteString(m.dimStyle.Render("zen free tier · no login needed"))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+	// The cast: each Pandava in banner color, sigil and byname.
 	for _, name := range agents.AgentNames(m.agentsState) {
-		sb.WriteString(m.agentStyle.Render(" " + name + " "))
-		sb.WriteString(" ")
+		sb.WriteString(m.agentChip(name))
+		sb.WriteString("  ")
 	}
 	m.viewport.SetContent(sb.String())
 	m.viewport.GotoTop()
@@ -1018,6 +1308,10 @@ func (m *Model) renderConversation() {
 	}
 	m.homeMirrored = false
 	var sb strings.Builder
+	// The answering persona speaks under its own banner: the active
+	// Pandava's name in the Pandava's color.
+	voice := m.activeAgentName()
+	answerLabel := assistantStyle(voice).Render("▌ " + voice)
 	for _, b := range m.blocks {
 		switch b.kind {
 		case blockUser:
@@ -1025,7 +1319,7 @@ func (m *Model) renderConversation() {
 			sb.WriteString("\n")
 			sb.WriteString(m.renderMarkdown(b.text))
 		case blockAssistant:
-			sb.WriteString(m.assistantLabel.Render("▌ kaal"))
+			sb.WriteString(answerLabel)
 			sb.WriteString("\n")
 			sb.WriteString(m.renderMarkdown(b.text))
 		case blockTool:
@@ -1040,7 +1334,12 @@ func (m *Model) renderConversation() {
 		}
 	}
 	if m.thinking && m.turnActive {
-		sb.WriteString(m.dimStyle.Render(spinnerFrames[m.thinkFrame%len(spinnerFrames)] + " thinking"))
+		st := lipgloss.NewStyle().Foreground(colorSaffron)
+		if m.connecting {
+			sb.WriteString(st.Render("◈ opening " + m.streamHost() + " …"))
+		} else {
+			sb.WriteString(st.Render(chakraFrames[m.thinkFrame%len(chakraFrames)] + " thinking"))
+		}
 		sb.WriteString("\n")
 	}
 	m.viewport.SetContent(sb.String())
@@ -1261,27 +1560,25 @@ func (m *Model) sidebarView() string {
 // -- status bar --------------------------------------------------------------------------
 
 func (m *Model) statusBar() string {
-	agentName := "—"
-	if m.agent != nil {
-		agentName = m.agent.Name
-	}
+	agentName := m.activeAgentName()
 	clock := time.Now().Format("Mon 02 Jan 15:04")
 	rate := m.tools.CacheHitRate()
 	cache := "cache –"
 	if rate >= 0 {
 		cache = fmt.Sprintf("cache %.0f%%", rate*100)
 	}
+	sep := m.dimStyle.Render("│")
 	var sb strings.Builder
-	sb.WriteString(m.agentStyle.Render(" " + agentName + " "))
-	sb.WriteString("│")
+	sb.WriteString(m.agentBadge(agentName))
+	sb.WriteString(sep)
 	sb.WriteString(fmt.Sprintf(" step %d/%d ", m.steps, m.maxSteps))
-	sb.WriteString("│")
+	sb.WriteString(sep)
 	sb.WriteString(fmt.Sprintf(" %.0f tok/s ", m.rate))
-	sb.WriteString("│")
+	sb.WriteString(sep)
 	sb.WriteString(" " + cache + " ")
-	sb.WriteString("│")
+	sb.WriteString(sep)
 	sb.WriteString(fmt.Sprintf(" $%.4f ", m.totalCost))
-	sb.WriteString("│")
+	sb.WriteString(sep)
 	sb.WriteString(m.rightStyle.Render(" " + clock + " "))
 	return sb.String()
 }
@@ -1317,7 +1614,42 @@ func (m *Model) openConnectModal() {
 	in.ShowLineNumbers = false
 	in.SetWidth(50)
 	in.Focus()
-	m.modal = &modal{kind: modalConnect, title: "Connect", input: &in}
+	title := "Diksha — connect"
+	if m.pendingProvider != "" {
+		title = "Diksha — " + providerDisplayName(m.pendingProvider) + " API key"
+	}
+	m.modal = &modal{kind: modalConnect, title: title, input: &in}
+}
+
+// openProviderModal opens the /connect chooser: the two built-in providers
+// plus the BYOK escape hatch.
+func (m *Model) openProviderModal() {
+	m.pendingProvider = ""
+	items := []string{pickOpencode, pickOpencodeGo, pickCommand, pickAddAnother}
+	m.modal = &modal{kind: modalProviders, title: "Diksha — choose a provider", items: items, allItems: items}
+}
+
+// openProviderModels lists one picker choice's catalog slice. The opencode
+// tiers split the shared provider catalog by route: free lists the keyless
+// zen/v1 models, go lists the paid zen/go/v1 ones.
+func (m *Model) openProviderModels(pick string) {
+	var ids []string
+	for _, model := range config.Models {
+		p := config.ModelProvider(model.ID)
+		ok := false
+		switch pick {
+		case pickOpencode:
+			ok = p == config.ProviderOpencode && config.FreeTierModel(model.ID)
+		case pickOpencodeGo:
+			ok = p == config.ProviderOpencode && !config.FreeTierModel(model.ID)
+		default:
+			ok = p == pick
+		}
+		if ok {
+			ids = append(ids, model.ID)
+		}
+	}
+	m.openListModal(modalModels, "Astras — "+providerDisplayName(pick), ids)
 }
 
 func (m *Model) openAgentIntentModal() {
@@ -1327,6 +1659,21 @@ func (m *Model) openAgentIntentModal() {
 	in.SetWidth(60)
 	in.Focus()
 	m.modal = &modal{kind: modalAgentIntent, title: "New agent (AI)", input: &in}
+}
+
+// openCustomProviderForm opens the BYOK form: any OpenAI-compatible
+// endpoint plus its key. Enter probes <base>/models live.
+func (m *Model) openCustomProviderForm() {
+	url := textarea.New()
+	url.Placeholder = "https://api.example.com/v1"
+	url.ShowLineNumbers = false
+	url.SetWidth(56)
+	url.Focus()
+	key := textarea.New()
+	key.Placeholder = "paste API key"
+	key.ShowLineNumbers = false
+	key.SetWidth(56)
+	m.modal = &modal{kind: modalCustomProvider, title: "Add another provider", input: &url, input2: &key, formFocus: 0}
 }
 
 func (m *Model) openAgentFormModal() {
@@ -1475,6 +1822,62 @@ func (m *Model) handleModalKey(msg tea.KeyMsg) tea.Cmd {
 			*mod.input, cmd = mod.input.Update(msg)
 			return cmd
 		}
+	case modalProviders:
+		switch msg.String() {
+		case "up", "k":
+			if mod.cursor > 0 {
+				mod.cursor--
+			}
+		case "down", "j":
+			if mod.cursor < len(mod.items)-1 {
+				mod.cursor++
+			}
+		case "enter":
+			if mod.cursor < len(mod.items) {
+				m.closeModal(mod.items[mod.cursor])
+			}
+		case "esc":
+			m.closeModal(nil)
+		}
+	case modalCustomProvider:
+		if mod.input == nil || mod.input2 == nil {
+			return nil
+		}
+		switch msg.String() {
+		case "tab", "shift+tab":
+			mod.formFocus = 1 - mod.formFocus
+			if mod.formFocus == 0 {
+				mod.input.Focus()
+				mod.input2.Blur()
+			} else {
+				mod.input2.Focus()
+				mod.input.Blur()
+			}
+		case "enter":
+			if !isShift(msg) {
+				base := strings.TrimSpace(mod.input.Value())
+				key := strings.TrimSpace(mod.input2.Value())
+				if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+					m.appendNotice("add provider: base URL must start with http:// or https://")
+					return nil
+				}
+				m.closeModal(customProviderForm{baseURL: base, apiKey: key})
+			} else if mod.formFocus == 0 {
+				mod.input.InsertString("\n")
+			} else {
+				mod.input2.InsertString("\n")
+			}
+		case "esc":
+			m.closeModal(nil)
+		default:
+			var cmd tea.Cmd
+			if mod.formFocus == 0 {
+				*mod.input, cmd = mod.input.Update(msg)
+			} else {
+				*mod.input2, cmd = mod.input2.Update(msg)
+			}
+			return cmd
+		}
 	case modalConnect, modalAsk:
 		if mod.input == nil {
 			return nil
@@ -1545,16 +1948,50 @@ func (m *Model) closeModal(value any) {
 		}
 	case modalModels:
 		if id, ok := value.(string); ok {
+			if m.pickingForCustom {
+				// Finalize the BYOK choice: store the model so the custom
+				// provider owns this id for every future lookup.
+				m.pickingForCustom = false
+				if cp := config.LoadCustomProvider(); cp != nil {
+					cp.Model = id
+					_ = config.SaveCustomProvider(*cp)
+					m.appendNotice("provider: " + cp.Name + " · model: " + id)
+				}
+			}
 			m.setModel(id)
+			m.applySavedKeyFor(config.ModelProvider(m.modelID))
+		}
+	case modalProviders:
+		if pick, ok := value.(string); ok {
+			switch pick {
+			case pickOpencode, pickOpencodeGo, pickCommand:
+				m.providerFlow(pick)
+			case pickAddAnother:
+				m.openCustomProviderForm()
+			}
+		}
+	case modalCustomProvider:
+		if form, ok := value.(customProviderForm); ok {
+			m.startCustomProvider(form.baseURL, form.apiKey)
 		}
 	case modalConnect:
+		flow := m.pendingProvider // picker flow: after the key lands, straight to its models
+		target := config.ModelProvider(m.modelID)
+		if flow != "" {
+			target = keyProviderFor(flow)
+		}
+		m.pendingProvider = ""
 		if key, ok := value.(string); ok && strings.TrimSpace(key) != "" {
-			if err := config.SaveUserAPIKey(strings.TrimSpace(key)); err != nil {
+			key = strings.TrimSpace(key)
+			if err := config.SaveUserAPIKeyFor(target, key); err != nil {
 				m.appendError("could not save API key: " + err.Error())
 			} else {
-				m.applySavedKey()
-				m.appendNotice("api key saved")
+				m.applySavedKeyFor(target)
+				m.appendNotice("api key saved (" + providerDisplayName(flow) + ")")
 			}
+		}
+		if flow != "" {
+			m.openProviderModels(flow)
 		}
 	case modalAgents:
 		if name, ok := value.(string); ok {
@@ -1587,6 +2024,15 @@ func (m *Model) resumeSession(sid string) {
 func (m *Model) setModel(modelID string) {
 	m.modelID = modelID
 	_ = config.SaveUserModel(modelID)
+	// Retarget the live gateway so the switch takes effect this session,
+	// not just on the next launch.
+	if g, ok := m.gateway.(*gateway.Gateway); ok {
+		g.BaseURL = config.ModelBaseURL(modelID)
+		g.Model = modelID
+	}
+	_, keyErr := config.GetAPIKeyFor(config.ModelProvider(modelID))
+	m.freeKeyless = keyErr != nil && config.FreeTierModel(modelID)
+	m.keyMissing = keyErr != nil && !config.FreeTierModel(modelID)
 	m.appendNotice("model: " + modelID)
 }
 
@@ -1603,143 +2049,270 @@ func (m *Model) View() string {
 		if len(session) > 15 {
 			session = session[:15]
 		}
-		brand := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("KAAL")
+		brand := lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render("KAAL")
 		identity := m.dimStyle.Render("  " + model + " · " + session + "  ")
 		actions := m.dimStyle.Render("[New chat] [Sessions] [Agents]")
-		topbar = lipgloss.NewStyle().Width(m.width).BorderBottom(true).Render(
+		topbar = lipgloss.NewStyle().Width(m.innerW).BorderBottom(true).Render(
 			brand+identity+actions,
 		) + "\n"
 	}
+	var content string
 	if m.modal != nil {
-		return topbar + m.modalView()
-	}
-	sidebar := ""
-	if m.sidebarVisible {
-		header := lipgloss.NewStyle().Bold(true).Render("Workspace")
-		tabs := ""
-		for i, name := range []string{"Trace", "Memory", "Sessions"} {
-			if i == m.sidebarTab {
-				tabs += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render(" " + name + " ")
-			} else {
-				tabs += m.dimStyle.Render(" " + name + " ")
+		content = topbar + m.modalView()
+	} else {
+		sidebar := ""
+		if m.sidebarVisible {
+			header := lipgloss.NewStyle().Bold(true).Render("Workspace")
+			tabs := ""
+			for i, name := range []string{"Trace", "Memory", "Sessions"} {
+				if i == m.sidebarTab {
+					tabs += lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render(" " + name + " ")
+				} else {
+					tabs += m.dimStyle.Render(" " + name + " ")
+				}
 			}
+			sidebar = lipgloss.NewStyle().Width(sidebarWidth).BorderLeft(true).Render(
+				header + "\n" + tabs + "\n" + m.sidebarView(),
+			)
 		}
-		sidebar = lipgloss.NewStyle().Width(sidebarWidth).BorderLeft(true).Render(
-			header + "\n" + tabs + "\n" + m.sidebarView(),
-		)
-	}
 
-	state := "ready"
-	if m.turnActive {
-		state = "busy — ctrl+c cancels"
-	}
-	composer := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("Message kaal · ") +
-		lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Render(state) + "\n" +
-		m.input.View()
-
-	suggestions := ""
-	if m.suggestionsVisible && len(m.suggestions) > 0 {
-		var sb strings.Builder
-		for i, cmd := range m.suggestions {
-			if i == m.suggestIndex {
-				sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("  " + cmd))
-			} else {
-				sb.WriteString(m.dimStyle.Render("  " + cmd))
+		conversation := m.viewport.View()
+		if m.suggestionsVisible && len(m.suggestions) > 0 {
+			// The palette floats over the conversation's lower rows — it must
+			// never shove the layout around.
+			w := m.viewport.Width
+			if w > 64 {
+				w = 64
 			}
-			sb.WriteString("\n")
+			conversation = overlayBottom(conversation, m.renderSuggestionPopup(w))
 		}
-		suggestions = lipgloss.NewStyle().Width(m.width).BorderTop(true).Render(
-			strings.TrimRight(sb.String(), "\n"),
-		) + "\n"
+
+		state := "ready"
+		if m.turnActive {
+			state = "busy — ctrl+c cancels"
+		}
+		composer := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("Message kaal · ") +
+			lipgloss.NewStyle().Foreground(colorGold).Render(state) + "\n" +
+			m.input.View()
+
+		status := m.statusBar()
+
+		content += topbar +
+			lipgloss.JoinHorizontal(lipgloss.Top, conversation, sidebar) + "\n" +
+			composer + "\n" +
+			status
 	}
 
-	status := m.statusBar()
-
-	return topbar +
-		lipgloss.JoinHorizontal(lipgloss.Top, m.viewport.View(), sidebar) + "\n" +
-		suggestions +
-		composer + "\n" +
-		status
+	// The whole window floats inside a 4-cell frame.
+	frame := lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		MaxHeight(m.height).
+		Padding(appPadding)
+	return frame.Render(content)
 }
 
-// modalView renders the active modal (sessions/models/agents lists, connect
-// key entry, agent form, ask question) instead of the composer.
+// modalTopMargin is the breathing room above every dialog.
+const modalTopMargin = 8
+
+// modalPage splits a dialog into a fixed header, the scrollable rows, and a
+// hint footer — the only part of a modal that ever overflows is rows.
+type modalPage struct {
+	header string
+	rows   []string
+	footer string
+}
+
+// buildModalPage renders each dialog's content as page sections. Rows map
+// one-to-one onto mod.items for list dialogs so cursor scrolling stays
+// trivially aligned.
+func (m *Model) buildModalPage(mod *modal) modalPage {
+	switch mod.kind {
+	case modalSessions, modalAgents:
+		var p modalPage
+		p.footer = "enter select · esc close"
+		if mod.kind == modalAgents {
+			p.footer = "enter activate · n new · d delete · esc close"
+		}
+		if len(mod.items) == 0 {
+			p.rows = []string{m.dimStyle.Render("(empty)")}
+			return p
+		}
+		for i, item := range mod.items {
+			line := item
+			if mod.kind == modalAgents {
+				// The Sabha lists each persona under its own sigil.
+				id := identityFor(item)
+				line = id.glyph + " " + item
+				if id.epithet != "" {
+					line += m.dimStyle.Render(" — " + id.epithet)
+				}
+			}
+			if i == mod.cursor {
+				line = lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render("▸ " + line)
+			} else {
+				line = "  " + line
+			}
+			p.rows = append(p.rows, line)
+		}
+		return p
+	case modalModels:
+		var p modalPage
+		if mod.input != nil {
+			p.header = m.dimStyle.Render("filter: ") + mod.input.View()
+		}
+		p.footer = "enter select · esc close"
+		for i, id := range mod.items {
+			line := id
+			if price := modelPriceLine(id); price != "" {
+				line += m.dimStyle.Render("  " + price)
+			}
+			if config.ModelProvider(id) == config.ProviderCommandCode {
+				line += m.dimStyle.Render("  · cmd")
+			}
+			if i == mod.cursor {
+				line = lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render("▸ " + line)
+			} else {
+				line = "  " + line
+			}
+			p.rows = append(p.rows, line)
+		}
+		return p
+	case modalProviders:
+		var p modalPage
+		p.footer = "enter choose · esc cancel"
+		if len(mod.items) == 0 {
+			p.rows = []string{m.dimStyle.Render("(empty)")}
+			return p
+		}
+		for i, item := range mod.items {
+			line := m.providerItemLabel(item)
+			if i == mod.cursor {
+				line = lipgloss.NewStyle().Bold(true).Foreground(colorSaffron).Render("▸ " + line)
+			} else {
+				line = "  " + line
+			}
+			p.rows = append(p.rows, line)
+		}
+		return p
+	case modalCustomProvider:
+		return modalPage{rows: []string{
+			m.dimStyle.Render("base URL (OpenAI-compatible):"),
+			mod.input.View(),
+			m.dimStyle.Render("API key:"),
+			mod.input2.View(),
+			m.dimStyle.Render("tab switch · enter fetch models · esc cancel"),
+		}}
+	case modalConnect:
+		provider := keyProviderFor(m.pendingProvider)
+		envName := "OPENCODE_API_KEY"
+		if provider == config.ProviderCommandCode {
+			envName = "CMD_API_KEY"
+		}
+		return modalPage{rows: []string{
+			m.dimStyle.Render(fmt.Sprintf("paste the %s API key (never displayed):", providerDisplayName(m.pendingProvider))),
+			mod.input.View(),
+			m.dimStyle.Render("enter save · esc cancel · env: " + envName),
+		}}
+	case modalAgentForm:
+		return modalPage{rows: []string{
+			m.dimStyle.Render("name:"),
+			mod.input.View(),
+			m.dimStyle.Render("description:"),
+			mod.input2.View(),
+			m.dimStyle.Render("tab switch · enter save · esc cancel"),
+		}}
+	case modalAgentIntent:
+		return modalPage{rows: []string{
+			m.dimStyle.Render("describe the agent you want — the model invents it:"),
+			mod.input.View(),
+			m.dimStyle.Render("enter generate · esc cancel"),
+		}}
+	case modalAsk:
+		rows := []string{}
+		for i, opt := range mod.askOptions {
+			rows = append(rows, m.dimStyle.Render(fmt.Sprintf("  %d. %s", i+1, opt)))
+		}
+		rows = append(rows, mod.input.View(), m.dimStyle.Render("enter answer · esc cancel"))
+		return modalPage{rows: rows}
+	}
+	return modalPage{}
+}
+
+// modalView renders the active modal: a centered card with an 8-row top
+// margin whose scrollable section never exceeds the screen.
 func (m *Model) modalView() string {
 	mod := m.modal
 	if mod == nil {
 		return ""
 	}
-	title := lipgloss.NewStyle().Bold(true).Render(mod.title)
-	var body strings.Builder
-	switch mod.kind {
-	case modalSessions, modalAgents:
-		if len(mod.items) == 0 {
-			body.WriteString(m.dimStyle.Render("(empty)"))
-			break
-		}
-		for i, item := range mod.items {
-			if i == mod.cursor {
-				body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("▸ " + item))
-			} else {
-				body.WriteString("  " + item)
-			}
-			body.WriteString("\n")
-		}
-		if mod.kind == modalAgents {
-			body.WriteString(m.dimStyle.Render("enter activate · n new · d delete · esc close"))
-		}
-	case modalModels:
-		if mod.input != nil {
-			body.WriteString(m.dimStyle.Render("filter: ") + mod.input.View() + "\n\n")
-		}
-		for i, id := range mod.items {
-			price := modelPriceLine(id)
-			line := id
-			if price != "" {
-				line += m.dimStyle.Render("  " + price)
-			}
-			if i == mod.cursor {
-				body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Render("▸ " + line))
-			} else {
-				body.WriteString("  " + line)
-			}
-			body.WriteString("\n")
-		}
-		body.WriteString(m.dimStyle.Render("enter select · esc close"))
-	case modalConnect:
-		if mod.input != nil {
-			body.WriteString(m.dimStyle.Render("paste the API key (never displayed):") + "\n")
-			body.WriteString(mod.input.View() + "\n")
-			body.WriteString(m.dimStyle.Render("enter save · esc cancel"))
-		}
-	case modalAgentForm:
-		if mod.input != nil && mod.input2 != nil {
-			body.WriteString(m.dimStyle.Render("name:") + "\n")
-			body.WriteString(mod.input.View() + "\n")
-			body.WriteString(m.dimStyle.Render("description:") + "\n")
-			body.WriteString(mod.input2.View() + "\n")
-			body.WriteString(m.dimStyle.Render("tab switch · enter save · esc cancel"))
-		}
-	case modalAgentIntent:
-		if mod.input != nil {
-			body.WriteString(m.dimStyle.Render("describe the agent you want — the model invents it:") + "\n")
-			body.WriteString(mod.input.View() + "\n")
-			body.WriteString(m.dimStyle.Render("enter generate · esc cancel"))
-		}
-	case modalAsk:
-		if mod.input != nil {
-			body.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("222")).Render(mod.title) + "\n")
-			for i, opt := range mod.askOptions {
-				body.WriteString(m.dimStyle.Render(fmt.Sprintf("  %d. %s", i+1, opt)) + "\n")
-			}
-			body.WriteString(mod.input.View() + "\n")
-			body.WriteString(m.dimStyle.Render("enter answer · esc cancel"))
-		}
+	page := m.buildModalPage(mod)
+
+	headerLines := 0
+	if page.header != "" {
+		headerLines = strings.Count(page.header, "\n") + 1
 	}
-	box := lipgloss.NewStyle().Width(m.width-4).Border(lipgloss.RoundedBorder()).Padding(0, 1).Render(
-		title + "\n\n" + strings.TrimRight(body.String(), "\n"),
-	)
-	return box + "\n"
+	footerLines := 0
+	if page.footer != "" {
+		footerLines++
+	}
+	// The top margin shrinks before the scrollable section does: on short
+	// screens the card keeps its rows and surrenders margin first.
+	margin := modalTopMargin
+	listMax := func() int {
+		usable := m.innerH - 1 - margin // trailing newline + top margin
+		if m.topbarVisible {
+			usable -= 2
+		}
+		return usable - 4 - headerLines - footerLines // borders(2)+title(1)+blank(1)
+	}
+	for margin > 0 && listMax() < 2 {
+		margin--
+	}
+	rowsMax := listMax()
+	if rowsMax < 1 {
+		rowsMax = 1
+	}
+
+	body := ""
+	if page.header != "" {
+		body += page.header + "\n"
+	}
+	if len(page.rows) > rowsMax {
+		start, end := suggestionWindow(len(page.rows), mod.cursor, rowsMax)
+		shown := page.rows[start:end]
+		scrollNote := m.dimStyle.Render(fmt.Sprintf("  ↑↓ %d–%d of %d",
+			start+1, end, len(page.rows)))
+		if page.footer != "" {
+			page.footer += scrollNote
+		} else {
+			shown = append(shown[:len(shown):len(shown)], scrollNote)
+		}
+		body += strings.Join(shown, "\n")
+	} else {
+		body += strings.Join(page.rows, "\n")
+	}
+	if page.footer != "" {
+		body += "\n" + page.footer
+	}
+
+	title := lipgloss.NewStyle().Bold(true).Render(mod.title)
+	// Dialogs read best as centered cards: capped width, saffron frame,
+	// floated to the middle of the screen instead of stretching edge-to-edge.
+	w := m.innerW - 8
+	if w < 24 {
+		w = 24
+	}
+	if w > 76 {
+		w = 76
+	}
+	box := lipgloss.NewStyle().Width(w).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorSaffron).
+		Padding(0, 1).
+		Render(title + "\n\n" + strings.TrimRight(body, "\n"))
+	centered := lipgloss.NewStyle().Width(m.innerW).Align(lipgloss.Center).Render(box)
+	return strings.Repeat("\n", margin) + centered + "\n"
 }
 
 // modelPriceLine renders '($in/$out per M)' for a catalog model.
@@ -1750,6 +2323,33 @@ func modelPriceLine(id string) string {
 		}
 	}
 	return ""
+}
+
+// providerItemLabel dresses one picker row: sigil, display name, and the
+// key state so the user knows what choosing it will ask of them.
+func (m *Model) providerItemLabel(item string) string {
+	switch item {
+	case pickOpencode:
+		label := "☸ opencode · zen free"
+		if _, err := config.GetAPIKeyFor(config.ProviderOpencode); err == nil {
+			return label + m.dimStyle.Render("  — no login needed")
+		}
+		return label + m.dimStyle.Render("  — keyless")
+	case pickOpencodeGo:
+		label := "◈ opencode · go plan"
+		if _, err := config.GetAPIKeyFor(config.ProviderOpencode); err == nil {
+			return label + m.dimStyle.Render("  — key ready")
+		}
+		return label + m.dimStyle.Render("  — needs OPENCODE_API_KEY")
+	case pickCommand:
+		label := "⌘ command-code"
+		if _, err := config.GetAPIKeyFor(config.ProviderCommandCode); err == nil {
+			return label + m.dimStyle.Render("  — key ready")
+		}
+		return label + m.dimStyle.Render("  — needs CMD_API_KEY")
+	default:
+		return "✶ add another provider…" + m.dimStyle.Render("  — any OpenAI-compatible endpoint")
+	}
 }
 
 func isShift(msg tea.KeyMsg) bool {

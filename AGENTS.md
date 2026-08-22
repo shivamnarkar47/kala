@@ -4,7 +4,7 @@
 
 ## TL;DR / 30-Second Orientation
 
-**What this is:** `kaal` is a Go agent harness — one static binary — that runs **DeepSeek V4 Flash** with tools, persistent memory, sessions, and a bubbletea TUI. Core packages are stdlib-only; `github.com/charmbracelet/*` appears ONLY in `internal/tui`; cobra (CLI) and modernc.org/sqlite (the omp auth-store read) are the other two dependencies.
+**What this is:** `kaal` is a Go agent harness — one static binary — that runs **opencode zen's keyless free tier** by default (`hy3-free` today; any `*-free` model works with no login) with tools, persistent memory, sessions, and a bubbletea TUI. Two providers: **opencode** (main; paid route zen/go/v1 + free tier zen/v1) and **Command Code** (`api.commandcode.ai/provider/v1`, OpenAI-shaped models only — e.g. `stealth/ox-alpha`; key `CMD_API_KEY`). Core packages are stdlib-only; `github.com/charmbracelet/*` appears ONLY in `internal/tui`; cobra (CLI) and modernc.org/sqlite (the omp auth-store read) are the other two dependencies.
 
 **Get productive immediately:**
 - `go build -o kaal ./cmd/kaal && ./kaal` — the bubbletea TUI (needs an API key)
@@ -46,7 +46,7 @@
 |---|---|---|
 | `prompt` | task to run (positional) | required |
 | `--dir DIR` | project directory — tools are cwd-constrained to it | cwd |
-| `--model MODEL` | model id | saved default, else `deepseek-v4-flash` |
+| `--model MODEL` | model id | saved default, else `hy3-free` (keyless) |
 | `--max-steps MAX_STEPS` | max agent turns | 20 |
 | `--memory-root MEMORY_ROOT` | memory directory | `<dir>/.agent-memory` |
 | `--allow-dangerous` | skip the destructive-command DENY list | off |
@@ -61,7 +61,7 @@
 
 **Exit codes:** `0` answer produced · `1` config/key/gateway/agent error · `2` loop error (max steps, context overflow, tool loop, 5 consecutive tool failures).
 
-**API key:** env `OPENCODE_API_KEY` → user key store `~/.config/kaal/api_key` (0600; saved from the TUI via `/connect`) → omp auth store `~/.omp/agent/agent.db` (read-only sqlite via modernc.org/sqlite — pure Go, no cgo). The TUI **starts keyless** (home screen hints `/connect`; sending is blocked until a key resolves) — only headless `kaal run`/`kaal doctor` exit 1 with instructions when missing. Never cache or write it outside `config.SaveUserAPIKey`.
+**API keys:** per provider — except zen's free tier, which is **keyless**: `*-free` models (and `grok-code`/`big-pickle`) accept anonymous requests on `zen/v1`, so kaal runs with no login at all; dummy bearer tokens are rejected, so the gateway omits Authorization entirely when keyless. **opencode:** env `OPENCODE_API_KEY` → user key store `~/.config/kaal/api_key` (0600; saved from the TUI via `/connect`) → the opencode CLI's own login store `~/.local/share/opencode/auth.json` (`opencode-go` credential) → omp auth store `~/.omp/agent/agent.db` (read-only sqlite via modernc.org/sqlite — pure Go, no cgo). **Command Code:** env `CMD_API_KEY` (alias `COMMANDCODE_API_KEY`) → user key store `~/.config/kaal/api_key.commandcode` → shared auth files (`~/.commandcode/auth.json`, `~/.omp/agent/auth.json`, `~/.pi/agent/auth.json` — the shapes the official CLI and pi/OMP write). `/connect` opens a provider picker: opencode with a resolvable key jumps straight to its model list; command-code asks for its key first; "add another provider" is BYOK — base URL + key, kaal probes `<base>/models` live and persists the pick to `~/.config/kaal/custom_provider.json` (0600), which then owns that model id for every routing lookup (`config.ModelProvider`/`ModelBaseURL`; env override `<NAME>_API_KEY`). `/connect <key>` inline still saves to the active model's provider store. The TUI **starts keyless** (home screen hints `/connect`; sending is blocked until a key resolves) — only headless `kaal run`/`kaal doctor` exit 1 with instructions when missing. Never cache or write keys outside `config.SaveUserAPIKeyFor`.
 
 **Sessions:** each session is a JSONL record at `~/.local/share/kaal/sessions/` (override: env `KAAL_SESSIONS_DIR`). The id takes the form `%Y%m%d-%H%M%S-%f` (microseconds, spin-guarded against same-tick collisions — `internal/sessions`).
 
@@ -75,7 +75,7 @@
 | `/sessions` | session switcher (Enter resume · n new · d delete) |
 | `/models` | model switcher with filter + per-M prices |
 | `/agents` | persona switcher (Enter activate · n new form · d delete) |
-| `/connect [key]` | save the API key (inline or popup) |
+| `/connect [key]` | provider picker (opencode free · opencode go · command-code · add another BYOK); inline `<key>` saves to the active provider's store |
 | `/memory` | show memory digest + file paths |
 | `/model` | show current model id |
 | `/verbose` | toggle reasoning display |
@@ -149,6 +149,8 @@
 | stale tool results after external edits | tool cache is signature-keyed (changed tree = miss); `--no-tool-cache` disables |
 | `[verify] …` user message after a mutation batch | post-mutation self-check ran (`.kaal/hooks.json`) |
 | a JSON result with `"steps": 1.0` | a float round-trip crept back in — parse with `json.Number` (the parity gate caught this once) |
+| 403 `upgrade_required` on a command-code model | Go-plan account (no Provider API) — kaal auto-falls back to `/alpha/generate` and remembers it per process (`internal/gateway/commandcode.go`) |
+| `generate HTTP 400 … messages[N].role` | tool-result wire shape broke: every role:"tool" part MUST carry `toolName` (CLI defaults "unknown"); assistant turns replay text|reasoning|tool-call parts — pinned by `TestBuildGenerateBodyToolRoundTripShape` |
 
 ## 5. PITFALLS
 
