@@ -105,6 +105,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRunCmd(stdout, stderr))
 	root.AddCommand(newSessionsCmd(stdout, stderr))
 	root.AddCommand(newDoctorCmd(stdout, stderr))
+	root.AddCommand(newBenchCmd(stdout))
 	root.AddCommand(newUpdateCmd(stdout, stderr))
 	root.AddCommand(newDiagramsCmd(stdout, stderr))
 	// No subcommand: launch the bubbletea workbench (Python launches the
@@ -660,6 +661,62 @@ func sessionsShow(sessionID string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "%s | %s | %s\n", ts, etype, compact)
 	}
 	return nil
+}
+
+// -- bench ------------------------------------------------------------------------
+
+func newBenchCmd(stdout io.Writer) *cobra.Command {
+	var (
+		baseURL, model, apiKey, prompt string
+		requests, maxTokens, timeout   int
+		jsonMode                       bool
+	)
+	cmd := &cobra.Command{
+		Use:   "bench",
+		Short: "p50-p99 latency benchmark against the configured endpoint",
+		Long: "Fires sequential streaming completions and reports TTFT/total " +
+			"percentiles in a live view. Defaults ride the saved model's route; " +
+			"--json emits raw samples instead of the TUI.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if model == "" {
+				model = config.ResolveModelID("")
+			}
+			if baseURL == "" {
+				baseURL = config.ModelBaseURL(model)
+			}
+			if apiKey == "" && !config.FreeTierModel(model) {
+				key, err := config.GetAPIKeyFor(config.ModelProvider(model))
+				if err != nil {
+					return err
+				}
+				apiKey = key
+			}
+			cfg := tui.BenchConfig{
+				BaseURL: baseURL, Model: model, APIKey: apiKey,
+				Prompt: prompt, Requests: requests,
+				MaxTokens: maxTokens, TimeoutSec: timeout,
+			}
+			var code int
+			if jsonMode {
+				code = tui.BenchJSON(cfg, stdout)
+			} else {
+				code = tui.RunBench(cfg)
+			}
+			if code != 0 {
+				return &exitError{code: code}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&baseURL, "base-url", "", "gateway base URL (default: the active model's route)")
+	cmd.Flags().StringVar(&model, "model", "", "model id (default: saved or shipped default)")
+	cmd.Flags().StringVar(&apiKey, "api-key", "", "bearer token (default: provider key chain / keyless free tier)")
+	cmd.Flags().IntVar(&requests, "requests", 10, "number of sequential requests")
+	cmd.Flags().IntVar(&maxTokens, "max-tokens", 120, "completion budget per request")
+	cmd.Flags().StringVar(&prompt, "prompt", "Count from 1 to 20, digits separated by spaces.", "the prompt to send")
+	cmd.Flags().IntVar(&timeout, "timeout", 90, "per-request timeout in seconds")
+	cmd.Flags().BoolVar(&jsonMode, "json", false, "print raw samples as JSON instead of the live view")
+	return cmd
 }
 
 // -- doctor ---------------------------------------------------------------------

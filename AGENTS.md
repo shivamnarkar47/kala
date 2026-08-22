@@ -37,6 +37,8 @@
 | `kaal update` | Self-update: git pull + rebuild, main-branch tarball overlay, or prebuilt release binary (no git/go needed) |
 | `kaal diagrams <file.mmd>` | Render a mermaid diagram as terminal Unicode art via termaid (`uv tool install termaid`) |
 | `git config core.hooksPath .githooks` | Enable build-check hooks: pre-commit & pre-push run gofmt + vet + `go test -race` + version probe; skip with `KAAL_SKIP_HOOKS=1` |
+| `python3 scripts/benchmark.py` | p50–p99 TTFT/total latency against any OpenAI-compatible endpoint (defaults: zen free tier, keyless); `--base-url/--model/--api-key/--requests/--json` |
+| `kaal bench` | same benchmark as a live TUI report card (progress bar + percentiles); flags mirror the script; `--json` emits raw samples; exit 130 on ctrl+c abort |
 
 `kaal run -` reads the prompt from stdin in place of `"PROMPT"` — the route for piped input.
 

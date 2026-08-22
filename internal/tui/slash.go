@@ -222,6 +222,7 @@ func (m *Model) renderHelpPanel() string {
 	b.WriteString("\n")
 	b.WriteString(m.dimStyle.Render(
 		"  enter send · shift+enter newline · ctrl+p/n prompt history\n" +
+			"  wheel/pgup·pgdn scroll chat (pins at bottom, releases on scroll-up)\n" +
 			"  ↑↓/tab pick & complete a command · esc dismiss the popup\n" +
 			"  ctrl+s sidebar · ctrl+t topbar · ctrl+d diagrams · ctrl+l bottom\n" +
 			"  ctrl+g invent an agent · ctrl+c cancel turn · ctrl+q quit"))

@@ -130,6 +130,7 @@ const (
 	blockTool
 	blockNotice
 	blockError
+	blockMeta
 )
 
 type block struct {
@@ -243,8 +244,9 @@ type Model struct {
 	totalCost     float64
 
 	// view state
-	width, height  int // the terminal's true size
-	innerW, innerH int // inside the app frame (terminal minus 2×appPadding)
+	width, height  int  // the terminal's true size
+	innerW, innerH int  // inside the app frame (terminal minus 2×appPadding)
+	follow         bool // autoscroll pinned to the newest line; released on scroll-up
 	viewport       viewport.Model
 	input          textarea.Model
 	sidebarVisible bool
@@ -527,6 +529,7 @@ func NewWithGateway(gw loop.Gateway, projectDir, modelID string, maxSteps int, a
 		sessionID:       sessions.NewSessionID(),
 		historyIndex:    -1,
 		diagramsEnabled: true,
+		follow:          true,
 		agentsState:     agentState,
 		sendFn:          func(tea.Msg) {}, // no-op until Main wires the program
 		rightStyle:      lipgloss.NewStyle().Foreground(colorDim),
@@ -580,8 +583,9 @@ func (m *Model) Submit(task string) tea.Cmd {
 	m.rate = 0
 	m.turnStart = time.Now()
 	m.lastTickTime = m.turnStart
-	// The indicator must appear the moment Enter lands — not when the
-	// server's first byte does.
+	// A new prompt re-pins the live edge, and the indicator must appear
+	// the moment Enter lands — not when the server's first byte does.
+	m.follow = true
 	m.renderConversation()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -634,6 +638,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.resize()
 		m.renderConversation()
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			m.follow = false // reading history: release the pin
+			m.viewport.ScrollUp(3)
+		case tea.MouseWheelDown:
+			m.viewport.ScrollDown(3)
+			if m.viewport.AtBottom() {
+				m.follow = true // back at the live edge: re-pin
+			}
+		}
 	case tea.KeyMsg:
 		if cmd := m.handleKey(msg); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -824,7 +839,18 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "ctrl+n":
 		m.historyNext()
 	case "ctrl+l":
+		m.follow = true
 		m.viewport.GotoBottom()
+	case "pgup":
+		m.follow = false
+		m.viewport.HalfPageUp()
+		return nil
+	case "pgdown":
+		m.viewport.HalfPageDown()
+		if m.viewport.AtBottom() {
+			m.follow = true
+		}
+		return nil
 	case "ctrl+s":
 		m.sidebarVisible = !m.sidebarVisible
 		m.resize()
@@ -1125,6 +1151,16 @@ func (m *Model) onTurnDone(err error) {
 	m.connecting = false
 	m.flushMD()
 	m.closeUnclosedFence()
+	if err == nil {
+		// The receipt: wall time, steps, and effective tok/s for THIS turn.
+		took := time.Since(m.turnStart)
+		tps := 0.0
+		if secs := took.Seconds(); secs > 0 {
+			tps = float64(m.streamChars) / 3 / secs
+		}
+		m.appendMeta(fmt.Sprintf("⏱ %s · step %d · ~%.0f tok/s",
+			humanDuration(took), m.steps, tps))
+	}
 	m.renderConversation()
 	if err != nil && !errors.Is(err, loop.ErrCancelled) {
 		m.appendError(err.Error())
@@ -1138,7 +1174,9 @@ func (m *Model) onTurnDone(err error) {
 		m.cancelTurn = nil
 	}
 	m.input.Focus()
-	m.viewport.GotoBottom()
+	if m.follow {
+		m.viewport.GotoBottom()
+	}
 	m.renderMermaidDiagrams()
 }
 
@@ -1331,6 +1369,10 @@ func (m *Model) renderConversation() {
 		case blockError:
 			sb.WriteString(m.errorStyle.Render(b.text))
 			sb.WriteString("\n")
+		case blockMeta:
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorDim).
+				Faint(true).Render(b.text))
+			sb.WriteString("\n")
 		}
 	}
 	if m.thinking && m.turnActive {
@@ -1343,7 +1385,11 @@ func (m *Model) renderConversation() {
 		sb.WriteString("\n")
 	}
 	m.viewport.SetContent(sb.String())
-	m.viewport.GotoBottom()
+	if m.follow {
+		// Pinned to the live edge; a scroll-up releases this (see the
+		// wheel/pgup handlers) so reading history never gets yanked.
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m *Model) appendUserBlock(text string) {
@@ -1410,6 +1456,23 @@ func (m *Model) appendError(text string) {
 	m.transcript = append(m.transcript, "error: "+text+"\n")
 	m.blocks = append(m.blocks, block{kind: blockError, text: "error: " + text})
 	m.renderConversation()
+}
+
+// appendMeta appends a faint receipt line (timings, counters) under the
+// answer — content for the eyes, never fed back to the model.
+func (m *Model) appendMeta(text string) {
+	m.transcript = append(m.transcript, text+"\n")
+	m.blocks = append(m.blocks, block{kind: blockMeta, text: text})
+	m.renderConversation()
+}
+
+// humanDuration renders a turn duration: milliseconds under a second,
+// centisecond-precise seconds above.
+func humanDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(10 * time.Millisecond).String()
 }
 
 // -- mermaid rendering ----------------------------------------------------------------
@@ -2368,7 +2431,7 @@ func Main() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	program := tea.NewProgram(m, tea.WithAltScreen())
+	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	m.sendFn = program.Send
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "kaal: tui:", err)

@@ -1332,3 +1332,95 @@ func TestConnectingIndicatorShowsBeforeFirstByte(t *testing.T) {
 		t.Fatal("answer missing")
 	}
 }
+
+func TestResponseTimeFooter(t *testing.T) {
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("answer one\n"), doneEv("stop")},
+	)
+	env.runTurn(t, "first")
+	view := plain(env.view())
+	if !strings.Contains(view, "⏱") || !strings.Contains(view, "step 1") {
+		t.Fatalf("timing receipt missing: %q", tailOf(view, 300))
+	}
+
+	// Cancelled turns leave no receipt (nothing was kept).
+	env2 := setupTUI(t,
+		[]gateway.StreamEvent{sleepEvent(0.3), contentEv("late\n"), doneEv("stop")},
+	)
+	env2.submit(t, "slow")
+	time.Sleep(50 * time.Millisecond)
+	env2.m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	env2.waitTurn(t)
+	env2.drain(t)
+	if strings.Contains(plain(env2.view()), "⏱") {
+		t.Fatal("cancelled turn must not print a timing receipt")
+	}
+}
+
+func TestChatScrollFollowAndRelease(t *testing.T) {
+	// Wheel-up releases the follow pin and scrolls; new output must NOT
+	// yank the reader back. Returning to the live edge re-pins.
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("answer one\n"), doneEv("stop")},
+	)
+	env.runTurn(t, "first")
+	for i := 0; i < 30; i++ {
+		env.m.appendNotice(fmt.Sprintf("filler line %02d — padding the scroll range", i))
+	}
+	env.m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	if env.m.viewport.AtBottom() && env.m.viewport.YOffset == 0 {
+		t.Log("note: no scroll range at this size")
+	}
+	bottomY := env.m.viewport.YOffset
+
+	env.m.Update(tea.MouseMsg{Type: tea.MouseWheelUp})
+	env.m.Update(tea.MouseMsg{Type: tea.MouseWheelUp})
+	if env.m.follow {
+		t.Fatal("wheel-up must release the follow pin")
+	}
+	heldY := env.m.viewport.YOffset
+	if heldY >= bottomY {
+		t.Fatalf("wheel-up did not scroll: y=%d bottom=%d", heldY, bottomY)
+	}
+
+	// New content arrives while unpinned: no jump.
+	env.m.appendNotice("new output should not yank")
+	if y := env.m.viewport.YOffset; y != heldY {
+		t.Fatalf("unpinned viewport moved on append: %d → %d", heldY, y)
+	}
+
+	// Wheel back to the live edge re-pins.
+	for i := 0; i < 40 && !env.m.follow; i++ {
+		env.m.Update(tea.MouseMsg{Type: tea.MouseWheelDown})
+	}
+	if !env.m.follow || !env.m.viewport.AtBottom() {
+		t.Fatal("returning to the bottom must re-pin follow")
+	}
+}
+
+func TestChatScrollKeyboardPinning(t *testing.T) {
+	// pgup releases the pin; pgdown at the bottom and ctrl+l re-pin.
+	env := setupTUI(t,
+		[]gateway.StreamEvent{contentEv("answer\n"), doneEv("stop")},
+	)
+	env.runTurn(t, "first")
+	for i := 0; i < 40; i++ {
+		env.m.appendNotice(fmt.Sprintf("scroll filler %02d", i))
+	}
+	env.m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	env.m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if env.m.follow {
+		t.Fatal("pgup must release the pin")
+	}
+	env.m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	if !env.m.follow || !env.m.viewport.AtBottom() {
+		t.Fatal("ctrl+l must re-pin at the bottom")
+	}
+	env.m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	env.m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	env.m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if env.m.viewport.AtBottom() && !env.m.follow {
+		t.Fatal("at-bottom pgdown must re-pin")
+	}
+}

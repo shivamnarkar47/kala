@@ -918,3 +918,48 @@ func TestRunFreeTierKeyless(t *testing.T) {
 	}
 	_ = f
 }
+
+func TestBenchCommandJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"h\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	code, out, _ := runMain(t, "", "bench", "--json",
+		"--base-url", srv.URL, "--model", "test-model",
+		"--requests", "3", "--max-tokens", "20")
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	var doc struct {
+		TTFT   []float64 `json:"ttft"`
+		Total  []float64 `json:"total"`
+		Failed int       `json:"failed"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &doc); err != nil {
+		t.Fatalf("json: %v (%q)", err, out)
+	}
+	if len(doc.TTFT) != 3 || len(doc.Total) != 3 || doc.Failed != 0 {
+		t.Fatalf("samples: %+v", doc)
+	}
+	for i := range doc.TTFT {
+		if doc.TTFT[i] <= 0 || doc.Total[i] < doc.TTFT[i] {
+			t.Fatalf("sample %d: ttft=%v total=%v", i, doc.TTFT[i], doc.Total[i])
+		}
+	}
+
+	// A failing endpoint (all requests error) must exit 1.
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"error":{"message":"nope"}}`)
+	}))
+	defer failing.Close()
+	code, _, _ = runMain(t, "", "bench", "--json",
+		"--base-url", failing.URL, "--model", "m", "--requests", "2")
+	if code != 1 {
+		t.Fatalf("all-failed bench code %d", code)
+	}
+}

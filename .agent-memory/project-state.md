@@ -156,3 +156,21 @@ session: What brings u here ? → ok
 
 ## 2026-08-23 04:05
 session: How are u ? → ok
+
+## 2026-08-23 04:07
+session: Commit and push → ok
+
+## 2026-08-23 04:09
+session: Push it to the origin → ok
+
+## 2026-08-23 04:14
+session: How to push ? → ok
+
+## 2026-08-23 04:17
+session: Who are u → ok
+
+## 2026-08-23 04:30
+Recreated docs/architecture.md (the 2026-08-02 version was missing from disk) with two mermaid diagrams updated to current architecture: (1) module map incl. Command Code /alpha/generate, BYOK custom providers, parallel tool batches, tool cache + verify hooks; (2) sequence diagram of one headless run turn. All facts re-verified against loop.go/gateway/commandcode.go/sessions.go/config.go before writing.
+
+## 2026-08-23 04:31
+session: Show me architecture diagram of this project → ok
